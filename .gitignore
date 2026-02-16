@@ -1,0 +1,14 @@
+# Ignore everything by default
+*
+
+# Include this file
+!.gitignore
+
+# Include the plugin folder
+!label_on_a_cable/
+!label_on_a_cable/**
+
+# Exclude generated/temporary files within the plugin
+__pycache__/
+*.pyc
+*.pyo
