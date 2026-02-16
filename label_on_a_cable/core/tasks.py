@@ -1,5 +1,6 @@
 """QgsTask subclasses for off-thread operations."""
 
+import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional
 
@@ -61,11 +62,14 @@ class FetchCategoriesTask(QgsTask):
         for cat in self.categories:
             if cat.image:
                 try:
+                    parsed = urllib.parse.urlparse(cat.image)
+                    if parsed.scheme not in ("http", "https"):
+                        continue
                     req = urllib.request.Request(
                         cat.image,
                         headers={"User-Agent": "QGIS LOC Plugin"},
                     )
-                    with urllib.request.urlopen(req, timeout=5) as resp:
+                    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
                         self.icon_data[cat.category_id] = resp.read()
                 except Exception:
                     pass
