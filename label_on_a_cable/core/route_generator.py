@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from qgis.core import (
+    Qgis,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
@@ -69,6 +70,11 @@ def generate_routes(
     project = QgsProject.instance()
     project_crs = project.crs()
     transform_ctx = project.transformContext()
+
+    # Convert snap tolerance from metres to project-CRS units.
+    # Geographic CRS uses degrees: 1 degree ≈ 111,320 m at the equator.
+    if project_crs.mapUnits() == Qgis.DistanceUnit.Degrees:
+        snap_tolerance = snap_tolerance / 111320.0
 
     line_configs, point_configs = _resolve_configs(layer_mappings, project)
     if not line_configs or not point_configs:
