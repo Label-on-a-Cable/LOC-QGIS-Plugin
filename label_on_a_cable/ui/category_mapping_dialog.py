@@ -137,6 +137,9 @@ class CategoryMappingDialog(QDialog):
         self._buttons.rejected.connect(self._on_cancel)
         root.addWidget(self._buttons)
 
+        # Populate preset combo from saved presets
+        self._refresh_preset_combo()
+
     def _on_cancel(self):
         """Cancel any running task and close."""
         if self._task is not None:
@@ -144,8 +147,6 @@ class CategoryMappingDialog(QDialog):
             self._task.taskTerminated.disconnect(self._on_categories_loaded)
             self._task = None
         self.reject()
-
-        self._refresh_preset_combo()
 
     # ------------------------------------------------------------------
     # Category fetch
