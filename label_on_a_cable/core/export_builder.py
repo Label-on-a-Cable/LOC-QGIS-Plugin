@@ -487,7 +487,7 @@ def _build_dual_loc_obj(
     raw = _get_raw_json(line_feature, "_dloc_json")
     if raw is not None:
         return _patch_dual_loc(raw, route, line_feature, mapping, category,
-                               origin_xy, dest_xy, now)
+                               origin_xy, dest_xy, now, location_id)
 
     loc_id = _get_tracking_id(line_feature, "_loc_id")
     origin_id = _get_tracking_id(line_feature, "_origin_id")
@@ -755,6 +755,7 @@ def _build_standalone_single_locs(
             if raw_sloc is not None:
                 result = _patch_standalone_sloc(
                     raw_sloc, feat, lm, cat_fields, pt_xy, now,
+                    location_id,
                 )
                 # Always include in payload — server deletes LOCs not
                 # present in the push.  updatedAt is preserved from raw
@@ -825,6 +826,7 @@ def _patch_standalone_sloc(
     cat_fields: List[CategoryField],
     pt_xy: Tuple[float, float],
     now: str,
+    location_id: str = "",
 ) -> dict:
     """Patch a raw standalone singleLOC dict with current QGIS values.
 
@@ -888,6 +890,8 @@ def _patch_standalone_sloc(
     patched["category_name"] = lm.category_name
     patched["category_type"] = "single"
     patched["LOC_type"] = "single"
+    if location_id:
+        patched["location_id"] = location_id
 
     return {
         "id": str(uuid4()),
@@ -968,6 +972,7 @@ def _patch_dual_loc(
     origin_xy: Tuple[float, float],
     dest_xy: Tuple[float, float],
     now: str,
+    location_id: str = "",
 ) -> dict:
     """Patch a raw dualLOC dict with current QGIS values.
 
@@ -1076,6 +1081,8 @@ def _patch_dual_loc(
     patched["category_name"] = mapping.category_name
     patched["category_type"] = "dual"
     patched["LOC_type"] = "dual"
+    if location_id:
+        patched["location_id"] = location_id
 
     return patched
 
@@ -1346,6 +1353,7 @@ def _rebuild_stops_from_raw(
             if not actual_name:
                 actual_name = asset_uid
             patched_sloc["actual_asset_name"] = actual_name
+            patched_sloc["location_id"] = location.location_id
 
             # Normalize to canonical "singleLoc" key for push endpoint.
             # Remove any case-variant keys from the original entry.

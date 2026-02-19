@@ -260,7 +260,20 @@ class LabelOnACablePlugin:
 
     def _on_location_selected(self, location):
         """Called when the user picks a Location in the sidebar."""
+        prev = self.active_location
         self.active_location = location
+
+        # If the location actually changed, invalidate all dependent state
+        # so stale mappings / pulled data can never be pushed to the wrong
+        # location.
+        if prev is not None and prev.location_id != location.location_id:
+            self.layer_mappings = []
+            self._categories_cache = {}
+            self.cached_routes = []
+            self._last_fingerprint = ""
+            self._pulled_loc_ids = set()
+            self._pulled_multi_stop_counts = {}
+
         self.iface.messageBar().pushSuccess(
             self.PLUGIN_NAME,
             f"Active location: {location.name}",
