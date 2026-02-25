@@ -89,7 +89,6 @@ class PushPreviewTask(QgsTask):
         self.status_code: Optional[int] = None
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
-        self.response_path: str = ""
 
     def run(self):
         try:
@@ -109,7 +108,6 @@ class PushPreviewTask(QgsTask):
             self.status_code = getattr(exc, "status_code", None)
             self.request_id = getattr(exc, "request_id", "")
             self.elapsed_seconds = getattr(exc, "elapsed_seconds", 0.0)
-            self.response_path = getattr(exc, "response_path", "")
             return False
         except Exception as exc:
             self.error = f"Preview failed: {exc}"
@@ -130,7 +128,6 @@ class PushTask(QgsTask):
         self.status_code: Optional[int] = None
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
-        self.response_path: str = ""
 
     def run(self):
         try:
@@ -144,7 +141,6 @@ class PushTask(QgsTask):
             self.status_code = getattr(exc, "status_code", None)
             self.request_id = getattr(exc, "request_id", "")
             self.elapsed_seconds = getattr(exc, "elapsed_seconds", 0.0)
-            self.response_path = getattr(exc, "response_path", "")
             return False
         except Exception as exc:
             self.error = f"Push failed: {exc}"

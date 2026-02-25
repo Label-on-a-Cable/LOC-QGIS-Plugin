@@ -120,13 +120,6 @@ def build_layers(
         - mappings: auto-generated LayerMapping for each layer
         - pulled_ids: set of all loc_id values from the server
     """
-    # Debug: dump raw pull data for inspection
-    try:
-        dump_path = os.path.join(os.path.expanduser("~"), "loc_pull_data.json")
-        with open(dump_path, "w", encoding="utf-8") as f:
-            _json.dump(locs_data, f, indent=2, default=str)
-    except Exception:
-        pass
 
     cat_lookup: Dict[str, Category] = {c.category_id: c for c in categories}
     field_name_maps = _build_field_name_maps(categories)

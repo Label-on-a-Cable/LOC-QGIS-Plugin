@@ -151,9 +151,6 @@ class PushPreviewDialog(QDialog):
                 detail_parts.append(f"Request-ID: {task.request_id}")
             if task.elapsed_seconds:
                 detail_parts.append(f"Elapsed: {task.elapsed_seconds:.1f}s")
-            if task.response_path:
-                detail_parts.append(f"Response saved: {task.response_path}")
-
             detail_parts.append(
                 "\nCheck server connectivity, then try again. "
                 "If the problem persists, contact your administrator."

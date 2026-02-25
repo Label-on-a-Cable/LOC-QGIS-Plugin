@@ -628,16 +628,6 @@ class LabelOnACablePlugin:
                 detail_lines.append(
                     f"Elapsed: {task.elapsed_seconds:.1f}s"
                 )
-            if task.response_path:
-                detail_lines.append(
-                    f"Server response saved: {task.response_path}"
-                )
-            import os
-            payload_path = os.path.join(
-                os.path.expanduser("~"), "loc_push_payload.json",
-            )
-            if os.path.exists(payload_path):
-                detail_lines.append(f"Payload saved: {payload_path}")
 
             # Distinguish true network failures from server-side 500s.
             # The server sometimes returns HTTP 500 (with a validation

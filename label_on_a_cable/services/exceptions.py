@@ -54,13 +54,11 @@ class ServerException(LOCAPIException):
         request_url="",
         request_id="",
         elapsed_seconds=0.0,
-        response_path="",
     ):
         super().__init__(message, status_code)
         self.request_url = request_url
         self.request_id = request_id
         self.elapsed_seconds = elapsed_seconds
-        self.response_path = response_path
 
 
 class ValidationException(LOCAPIException):

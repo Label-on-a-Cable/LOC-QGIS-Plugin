@@ -255,14 +255,6 @@ def build_payload(
         },
     }
 
-    # Debug: dump payload to file for inspection
-    try:
-        dump_path = os.path.join(os.path.expanduser("~"), "loc_push_payload.json")
-        with open(dump_path, "w", encoding="utf-8") as f:
-            _json.dump(payload, f, indent=2, default=str)
-    except Exception:
-        pass
-
     return payload
 
 
@@ -393,6 +385,24 @@ def validate_payload(
             issues.append((
                 "error",
                 f"Standalone dual LOC '{uid}' is missing loc_id.",
+            ))
+
+    # Invariant 5: Standalone singleLOC unique_asset_id values must be
+    # unique.  The server silently deduplicates by this key — duplicates
+    # cause entries to be dropped without error.
+    sloc_uid_counts: dict = {}
+    for sl in payload.get("single_locs", []):
+        uid = sl.get("unique_asset_id", "")
+        if uid:
+            sloc_uid_counts[uid] = sloc_uid_counts.get(uid, 0) + 1
+    for uid, count in sloc_uid_counts.items():
+        if count > 1:
+            issues.append((
+                "warning",
+                f"Standalone single LOC unique_asset_id '{uid}' is used "
+                f"by {count} features — the server will keep only one and "
+                f"silently drop the other {count - 1}. Check your Unique "
+                f"Asset Identifier mapping / attribute values.",
             ))
 
     return issues

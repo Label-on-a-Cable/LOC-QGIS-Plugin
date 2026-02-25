@@ -26,31 +26,6 @@ PUSH_TIMEOUT = 600    # seconds (10 min)
 _log = logging.getLogger("LOC.api_client")
 
 
-def _save_response_dump(response) -> str:
-    """Save a server response to disk for post-mortem analysis.
-
-    Returns the file path on success, empty string on failure.
-    """
-    try:
-        dump_path = os.path.join(
-            os.path.expanduser("~"), "loc_push_response.json",
-        )
-        dump = {
-            "url": str(response.url),
-            "status_code": response.status_code,
-            "headers": dict(response.headers),
-            "body": response.text[:5000] if response.text else "",
-            "elapsed_seconds": (
-                response.elapsed.total_seconds()
-                if response.elapsed else 0
-            ),
-        }
-        with open(dump_path, "w", encoding="utf-8") as fh:
-            _json.dump(dump, fh, indent=2, default=str)
-        return dump_path
-    except Exception:
-        return ""
-
 
 def _extract_request_id(headers) -> str:
     """Extract a trace/correlation ID from response headers."""
@@ -113,14 +88,12 @@ class ApiClient:
                 if response.elapsed else 0
             )
             request_id = _extract_request_id(response.headers)
-            response_path = _save_response_dump(response)
 
             _log.error(
                 "Server error: URL=%s  status=%d  elapsed=%.1fs  "
-                "request-id=%s  response_path=%s  body=%s",
+                "request-id=%s  body=%s",
                 response.url, status, elapsed,
                 request_id or "(none)",
-                response_path or "(not saved)",
                 body[:500],
             )
 
@@ -130,7 +103,6 @@ class ApiClient:
                 request_url=str(response.url),
                 request_id=request_id,
                 elapsed_seconds=elapsed,
-                response_path=response_path,
             )
 
         # --- Try to parse JSON body (may be empty) ---
