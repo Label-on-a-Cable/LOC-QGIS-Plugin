@@ -19,7 +19,7 @@ from .exceptions import (
     ValidationException,
 )
 
-BASE_URL = "http://63.33.18.108:8000/api"
+BASE_URL = "https://dashboard.loc.store/api"
 DEFAULT_TIMEOUT = 30  # seconds
 PUSH_TIMEOUT = 600    # seconds (10 min)
 

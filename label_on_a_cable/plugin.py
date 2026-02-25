@@ -672,9 +672,9 @@ class LabelOnACablePlugin:
         import webbrowser
         if self.active_location:
             loc_id = self.active_location.location_id
-            webbrowser.open(f"http://63.33.18.108:8080/viewlocs/{loc_id}")
+            webbrowser.open(f"https://dashboard.loc.store/viewlocs/{loc_id}")
         else:
-            webbrowser.open("http://63.33.18.108:8080")
+            webbrowser.open("https://dashboard.loc.store")
 
     # ------------------------------------------------------------------
     # Pull from LOC
