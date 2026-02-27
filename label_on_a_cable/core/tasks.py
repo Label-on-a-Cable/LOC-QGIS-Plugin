@@ -1,8 +1,8 @@
 """QgsTask subclasses for off-thread operations."""
 
-import urllib.parse
-import urllib.request
 from typing import Dict, List, Optional
+
+import requests as _requests
 
 from qgis.core import QgsMessageLog, QgsTask, Qgis
 
@@ -60,17 +60,11 @@ class FetchCategoriesTask(QgsTask):
 
         # Download category icons (best-effort, skip failures silently)
         for cat in self.categories:
-            if cat.image:
+            if cat.image and cat.image.startswith(("http://", "https://")):
                 try:
-                    parsed = urllib.parse.urlparse(cat.image)
-                    if parsed.scheme not in ("http", "https"):
-                        continue
-                    req = urllib.request.Request(
-                        cat.image,
-                        headers={"User-Agent": "QGIS LOC Plugin"},
-                    )
-                    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
-                        self.icon_data[cat.category_id] = resp.read()
+                    resp = _requests.get(cat.image, timeout=5)
+                    resp.raise_for_status()
+                    self.icon_data[cat.category_id] = resp.content
                 except Exception:
                     pass
         return True
