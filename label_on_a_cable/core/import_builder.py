@@ -550,24 +550,31 @@ def reconstruct_routes(
                     )
 
                     if run >= 2:
-                        # Ingress / Egress pair
+                        # Multiple stops at same coordinate.
+                        # Server can store N stops at one location (e.g.
+                        # IN/OUT pair for an enclosure PLUS a handhole).
+                        # Polyline has N duplicate vertices; create N
+                        # Stop objects so the export builder can match
+                        # them 1-to-1 with the raw JSON entries.
                         stop_num += 1
-                        label_in = (f"{line_name}_{s_name}_IN"
-                                    if line_name else f"{s_name}_IN")
-                        label_out = (f"{line_name}_{s_name}_OUT"
-                                     if line_name else f"{s_name}_OUT")
-                        stops.append(Stop(
-                            original_name=label_in,
-                            stop_type=StopType.INGRESS,
-                            stop_number=stop_num,
-                            **common,
-                        ))
-                        stops.append(Stop(
-                            original_name=label_out,
-                            stop_type=StopType.EGRESS,
-                            stop_number=stop_num,
-                            **common,
-                        ))
+                        for vi in range(run):
+                            if vi == 0:
+                                stype = StopType.INGRESS
+                                suffix = "_IN"
+                            elif vi == run - 1:
+                                stype = StopType.EGRESS
+                                suffix = "_OUT"
+                            else:
+                                stype = StopType.PASSTHROUGH
+                                suffix = f"_{vi + 1}"
+                            label = (f"{line_name}_{s_name}{suffix}"
+                                     if line_name else f"{s_name}{suffix}")
+                            stops.append(Stop(
+                                original_name=label,
+                                stop_type=stype,
+                                stop_number=stop_num,
+                                **common,
+                            ))
                     else:
                         # Single passthrough
                         stop_num += 1
