@@ -40,6 +40,7 @@ def compute_fingerprint(layer_mappings: List[LayerMapping]) -> str:
         hasher.update(lm.category_id.encode())
         hasher.update(lm.default_stop_type.encode())
         hasher.update(str(lm.include_in_routes).encode())
+        hasher.update(str(lm.enabled_for_export).encode())
         hasher.update(str(layer.featureCount()).encode())
 
         # Which QGIS fields are referenced by this mapping?

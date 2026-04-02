@@ -142,7 +142,7 @@ def _resolve_configs(
     point_configs: List[PointLayerConfig] = []
 
     for lm in mappings:
-        if not lm.include_in_routes:
+        if not lm.include_in_routes or not lm.enabled_for_export:
             continue
         layer = project.mapLayer(lm.layer_id)
         if not isinstance(layer, QgsVectorLayer):

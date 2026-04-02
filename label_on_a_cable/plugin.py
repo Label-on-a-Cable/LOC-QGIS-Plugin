@@ -490,7 +490,14 @@ class LabelOnACablePlugin:
             )
             return
 
-        if not self.cached_routes:
+        # Only warn about missing routes if line layers are actually mapped
+        has_line_mappings = any(
+            lm.enabled_for_export
+            and lm.category_id in self._categories_cache
+            and self._categories_cache[lm.category_id].is_dual
+            for lm in self.layer_mappings
+        )
+        if not self.cached_routes and has_line_mappings:
             reply = QMessageBox.question(
                 self.iface.mainWindow(),
                 "No Routes Generated",
@@ -528,6 +535,28 @@ class LabelOnACablePlugin:
             organization_id=self.auth.current_user.organization.org_id,
             pulled_loc_ids=self._pulled_loc_ids or None,
         )
+
+        # --- Warn if disabled layers could cause server-side deletion ---
+        disabled_names = [
+            lm.layer_name for lm in self.layer_mappings
+            if not lm.enabled_for_export and lm.category_id
+        ]
+        if disabled_names:
+            layer_list = "\n".join(f"  - {n}" for n in disabled_names)
+            reply = QMessageBox.warning(
+                self.iface.mainWindow(),
+                "Disabled Layers Will Be Removed from LOC",
+                "The following layers have 'Create in LOC' disabled:\n\n"
+                f"{layer_list}\n\n"
+                "Because the push is a full replacement, any LOCs "
+                "previously pushed for these layers will be DELETED "
+                "from the server.\n\n"
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         # --- Instrumentation: log metrics before push ---
         metrics = log_payload_metrics(payload)
@@ -672,7 +701,7 @@ class LabelOnACablePlugin:
         import webbrowser
         if self.active_location:
             loc_id = self.active_location.location_id
-            webbrowser.open(f"https://www.loc.store/viewlocs/{loc_id}")
+            webbrowser.open(f"https://dashboard.loc.store/viewlocs/{loc_id}")
         else:
             webbrowser.open("https://www.loc.store")
 

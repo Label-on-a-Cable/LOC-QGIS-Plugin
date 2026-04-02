@@ -114,6 +114,18 @@ class CategoryMappingDialog(QDialog):
         preset_bar.addStretch()
         root.addLayout(preset_bar)
 
+        # "Create in LOC" bulk toggle bar
+        export_bar = QHBoxLayout()
+        export_bar.addWidget(QLabel("Create in LOC:"))
+        btn_select_all = QPushButton("Select All")
+        btn_select_all.clicked.connect(self._select_all_export)
+        export_bar.addWidget(btn_select_all)
+        btn_deselect_all = QPushButton("Deselect All")
+        btn_deselect_all.clicked.connect(self._deselect_all_export)
+        export_bar.addWidget(btn_deselect_all)
+        export_bar.addStretch()
+        root.addLayout(export_bar)
+
         # Status label
         self._status = QLabel("Loading categories...")
         self._status.setVisible(True)
@@ -269,6 +281,18 @@ class CategoryMappingDialog(QDialog):
             else:
                 row.reset()
 
+    # ------------------------------------------------------------------
+    # Bulk export toggle
+    # ------------------------------------------------------------------
+
+    def _select_all_export(self):
+        for row in self._layer_rows:
+            row._export_cb.setChecked(True)
+
+    def _deselect_all_export(self):
+        for row in self._layer_rows:
+            row._export_cb.setChecked(False)
+
     def _delete_preset(self):
         name = self._preset_combo.currentText()
         if not name:
@@ -317,8 +341,30 @@ class _LayerRow:
         self._is_point_layer = (geom_type == QgsWkbTypes.PointGeometry)
         self._is_line_layer = (geom_type == QgsWkbTypes.LineGeometry)
 
-        self.group = QGroupBox(self.layer_name, parent)
+        self.group = QGroupBox(parent=parent)
         layout = QVBoxLayout(self.group)
+
+        # Header row: bold layer name + "Create in LOC" checkbox
+        header_row = QHBoxLayout()
+        name_label = QLabel(f"<b>{self.layer_name}</b>")
+        header_row.addWidget(name_label)
+        header_row.addStretch()
+        self._export_cb = QCheckBox("Create in LOC")
+        self._export_cb.setChecked(True)
+        self._export_cb.setToolTip(
+            "When unchecked, this layer will not be included in the "
+            "push to LOC. Its mapping is preserved but inactive."
+        )
+        header_row.addWidget(self._export_cb)
+        layout.addLayout(header_row)
+
+        # Container for all mapping controls — collapsed when export is off
+        self._detail_widget = QWidget()
+        self._detail_layout = QVBoxLayout(self._detail_widget)
+        self._detail_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._detail_widget)
+
+        self._export_cb.toggled.connect(self._on_export_toggled)
 
         # Category combo
         cat_row = QHBoxLayout()
@@ -333,7 +379,7 @@ class _LayerRow:
                 self._cat_combo.addItem(cat.name, cat.category_id)
         self._cat_combo.currentIndexChanged.connect(self._on_cat_changed)
         cat_row.addWidget(self._cat_combo)
-        layout.addLayout(cat_row)
+        self._detail_layout.addLayout(cat_row)
 
         # Include in route generation toggle
         if self._is_point_layer:
@@ -345,7 +391,7 @@ class _LayerRow:
         self._include_cb.setToolTip(
             "When unchecked, this layer is excluded from route generation."
         )
-        layout.addWidget(self._include_cb)
+        self._detail_layout.addWidget(self._include_cb)
 
         # Default stop type combo (point layers only)
         self._stop_type_combo = None
@@ -361,12 +407,12 @@ class _LayerRow:
             )
             st_row.addWidget(self._stop_type_combo)
             st_row.addStretch()
-            layout.addLayout(st_row)
+            self._detail_layout.addLayout(st_row)
 
         # Field mappings (built dynamically when category changes)
         self._fields_widget = QWidget()
         self._fields_layout = QFormLayout(self._fields_widget)
-        layout.addWidget(self._fields_widget)
+        self._detail_layout.addWidget(self._fields_widget)
 
         self._field_combos: List[tuple] = []  # (loc_field_name, QComboBox)
 
@@ -392,7 +438,7 @@ class _LayerRow:
                 self._on_stop_cat_changed
             )
             sc_row.addWidget(self._stop_cat_combo)
-            layout.addLayout(sc_row)
+            self._detail_layout.addLayout(sc_row)
 
             # Indented stop field mappings (built when stop category changes)
             self._stop_fields_widget = QWidget()
@@ -400,7 +446,11 @@ class _LayerRow:
             stop_outer.setContentsMargins(20, 0, 0, 0)  # indent
             self._stop_fields_layout = QFormLayout()
             stop_outer.addLayout(self._stop_fields_layout)
-            layout.addWidget(self._stop_fields_widget)
+            self._detail_layout.addWidget(self._stop_fields_widget)
+
+    def _on_export_toggled(self, checked: bool):
+        """Show or collapse the mapping detail section."""
+        self._detail_widget.setVisible(checked)
 
     def _on_cat_changed(self, _index):
         cat = self._selected_category()
@@ -564,6 +614,7 @@ class _LayerRow:
                 for name, combo in self._stop_field_combos
             ],
             include_in_routes=self._include_cb.isChecked(),
+            enabled_for_export=self._export_cb.isChecked(),
         )
 
     def restore(self, lm: LayerMapping):
@@ -606,7 +657,11 @@ class _LayerRow:
         # Set include in routes checkbox
         self._include_cb.setChecked(lm.include_in_routes)
 
+        # Set export toggle (triggers collapse/expand)
+        self._export_cb.setChecked(lm.enabled_for_export)
+
     def reset(self):
         """Reset this row to unmapped."""
         self._cat_combo.setCurrentIndex(0)
         self._include_cb.setChecked(True)
+        self._export_cb.setChecked(True)

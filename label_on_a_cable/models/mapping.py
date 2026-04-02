@@ -33,6 +33,7 @@ class LayerMapping:
     stop_category_name: str = ""            # display name
     stop_field_mappings: List[FieldMapping] = field(default_factory=list)
     include_in_routes: bool = True   # False = excluded from route generation
+    enabled_for_export: bool = True  # False = layer excluded from LOC push entirely
 
     def qgis_field_for(self, loc_field_name: str) -> str:
         """Return the QGIS field name mapped to a given LOC field, or ''."""
@@ -73,6 +74,7 @@ class LayerMapping:
                 for fm in self.stop_field_mappings
             ],
             "include_in_routes": self.include_in_routes,
+            "enabled_for_export": self.enabled_for_export,
         }
 
     @classmethod
@@ -100,6 +102,7 @@ class LayerMapping:
                 for fm in d.get("stop_field_mappings", [])
             ],
             include_in_routes=d.get("include_in_routes", True),
+            enabled_for_export=d.get("enabled_for_export", True),
         )
 
 

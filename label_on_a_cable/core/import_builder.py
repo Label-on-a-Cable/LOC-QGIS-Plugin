@@ -405,7 +405,7 @@ def reconstruct_routes(
     point_mappings: List[LayerMapping] = []
 
     for lm in layer_mappings:
-        if not lm.include_in_routes:
+        if not lm.include_in_routes or not lm.enabled_for_export:
             continue
         layer = project.mapLayer(lm.layer_id)
         if not isinstance(layer, QgsVectorLayer):

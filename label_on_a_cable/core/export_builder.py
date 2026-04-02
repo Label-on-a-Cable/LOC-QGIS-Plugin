@@ -123,6 +123,7 @@ def build_payload(
 
     mapping_by_layer: Dict[str, LayerMapping] = {
         lm.layer_id: lm for lm in layer_mappings
+        if lm.enabled_for_export
     }
     transforms = _build_wgs84_transforms(project, layer_mappings)
 
@@ -737,6 +738,9 @@ def _build_standalone_single_locs(
     entries: List[dict] = []
 
     for lm in layer_mappings:
+        if not lm.enabled_for_export:
+            continue
+
         cat = categories.get(lm.category_id)
         if not cat or not cat.is_single:
             continue
