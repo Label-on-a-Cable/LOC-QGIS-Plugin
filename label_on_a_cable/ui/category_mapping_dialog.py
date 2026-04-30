@@ -322,6 +322,7 @@ class _LayerRow:
         self._qgis_fields = [
             name for name in layer.fields().names()
             if not name.startswith("auxiliary_storage_")
+            and not name.startswith("_")
         ]
 
         # Keep single LOC categories for the stop category combo (line layers)

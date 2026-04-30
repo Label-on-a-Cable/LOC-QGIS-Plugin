@@ -158,9 +158,10 @@ class LabelOnACablePlugin:
     def _has_pulled_layers(self):
         """Check if any mapped layer has pulled tracking attributes.
 
-        Detects pulled data by checking for ``_loc_id`` in the layer
-        schema.  This survives actions that clear the ephemeral
-        ``_pulled_loc_ids`` flag (e.g. reopening the mapping dialog).
+        Detects pulled data by checking for a valid ``_loc_id`` value on
+        at least one feature.  Only memory layers from a Pull have valid
+        36-char UUIDs; Shapefiles may have truncated values from the old
+        field-based stamping approach, which must be ignored.
         """
         from qgis.core import QgsProject, QgsVectorLayer
 
@@ -169,8 +170,17 @@ class LabelOnACablePlugin:
             layer = project.mapLayer(lm.layer_id)
             if not isinstance(layer, QgsVectorLayer):
                 continue
-            if "_loc_id" in layer.fields().names():
-                return True
+            if "_loc_id" not in layer.fields().names():
+                continue
+            # Check first feature for a valid (non-truncated) UUID
+            for feat in layer.getFeatures():
+                try:
+                    val = feat.attribute("_loc_id")
+                except Exception:
+                    break
+                if val and len(str(val)) == 36:
+                    return True
+                break  # only need to check one feature
         return False
 
     def set_logged_in(self, logged_in):
@@ -240,6 +250,16 @@ class LabelOnACablePlugin:
             self.PLUGIN_NAME, "Signed out."
         )
 
+    def _on_auth_expired(self):
+        """Called when an API call returns 401/403 (token expired)."""
+        self.auth.logout()
+        self.active_location = None
+        self.set_logged_in(False)
+        self.iface.messageBar().pushWarning(
+            self.PLUGIN_NAME,
+            "Session expired — please sign in again.",
+        )
+
     def _on_workspace(self):
         """Toggle the workspace / location sidebar."""
         if self._sidebar is None:
@@ -251,6 +271,7 @@ class LabelOnACablePlugin:
             self._sidebar.location_selected.connect(
                 self._on_location_selected
             )
+            self._sidebar.auth_failed.connect(self._on_auth_expired)
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self._sidebar)
             self._sidebar.fetch_locations()
         else:
@@ -262,6 +283,10 @@ class LabelOnACablePlugin:
         """Called when the user picks a Location in the sidebar."""
         prev = self.active_location
         self.active_location = location
+
+        # Set active location for stamp cache lookups (route review, etc.)
+        from .core import export_builder as _eb
+        _eb._active_location_id = location.location_id
 
         # If the location actually changed, invalidate all dependent state
         # so stale mappings / pulled data can never be pushed to the wrong
@@ -518,7 +543,6 @@ class LabelOnACablePlugin:
             )
             return
 
-        import json as _json
         from qgis.core import Qgis, QgsMessageLog
         from .core.export_builder import (
             build_payload, log_payload_metrics, payload_summary,
@@ -687,9 +711,17 @@ class LabelOnACablePlugin:
                     "Push — Server Warning",
                     "\n".join(detail_lines),
                 )
+                # Data may have been committed — stamp IDs to be safe
+                from .core.export_builder import stamp_ids_after_push
+                stamp_ids_after_push(task.payload)
                 # Still open LOC so the user can verify
                 self._open_loc_page()
             return
+
+        # Stamp payload IDs onto layer features so subsequent pushes
+        # are treated as updates rather than creates.
+        from .core.export_builder import stamp_ids_after_push
+        stamp_ids_after_push(task.payload)
 
         self.iface.messageBar().pushSuccess(
             self.PLUGIN_NAME, task.message or "Push complete."
@@ -754,7 +786,7 @@ class LabelOnACablePlugin:
         from .core.import_builder import reconstruct_routes
         from .core.change_detector import compute_fingerprint
 
-        self.cached_routes = reconstruct_routes(mappings)
+        self.cached_routes = reconstruct_routes(mappings, skip_snapping=True)
         self._last_fingerprint = compute_fingerprint(mappings)
 
         n_layers = len(layers)

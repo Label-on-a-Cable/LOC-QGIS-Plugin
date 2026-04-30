@@ -31,6 +31,7 @@ from qgis.PyQt.QtCore import QVariant
 from ..models.category import Category, CategoryField
 from ..models.mapping import FieldMapping, LayerMapping
 from ..models.route import Route, Stop, StopType
+from .route_generator import generate_routes as _snap_generate_routes
 
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -386,6 +387,8 @@ def import_summary(locs_data: dict) -> dict:
 
 def reconstruct_routes(
     layer_mappings: List[LayerMapping],
+    *,
+    skip_snapping: bool = False,
 ) -> List[Route]:
     """Reconstruct Route objects from pulled QGIS layers.
 
@@ -395,6 +398,9 @@ def reconstruct_routes(
 
     Point features are matched by coordinate proximity (tight epsilon
     since both sides originate from the same API data).
+
+    Non-pulled line features (no ``_loc_id``) are handled by the
+    snapping-based generator so that newly added routes get stops.
 
     This avoids the snapping-based ``generate_routes()`` which incorrectly
     matches ALL point features to every line in dense areas.
@@ -488,6 +494,14 @@ def reconstruct_routes(
 
             line_name = _safe_feat_attr(feat, name_field)
             multi_id = _safe_feat_attr(feat, "_multi_id")
+            loc_id = _safe_feat_attr(feat, "_loc_id")
+
+            # Non-pulled feature — skip reconstruction, the snapping
+            # pass below will handle it.
+            if not loc_id:
+                _log(f"Skipping non-pulled feature '{line_name}' "
+                     f"for snapping pass")
+                continue
 
             # Read origin/dest names from line feature attributes
             origin_name = _safe_feat_attr(feat, "Actual Asset Name")
@@ -626,7 +640,97 @@ def reconstruct_routes(
                  f"({route.active_stop_count} intermediate)")
 
     _log(f"reconstruct_routes: {len(routes)} route(s) reconstructed")
-    return routes
+
+    # --- Snapping pass: discover new/moved stops and new routes ---
+    # Skipped on initial pull (all features are fresh from server).
+    if skip_snapping:
+        return routes
+
+    # Run the snapping generator on ALL mappings, then:
+    #  - Non-pulled features (no reconstruction result): use snap route as-is
+    #  - Pulled features: merge snap-discovered stops into the
+    #    reconstructed route (adds newly placed points, respects deleted
+    #    points — reconstruction already omits them from pt_index).
+    snap_routes = _snap_generate_routes(layer_mappings)
+    snap_by_key: Dict[Tuple[str, int], Route] = {}
+    for r in snap_routes:
+        snap_by_key[(r.line_layer_id, r.line_feature_id)] = r
+
+    merged_routes: List[Route] = []
+    reconstructed_keys: set = set()
+
+    for route in routes:
+        key = (route.line_layer_id, route.line_feature_id)
+        reconstructed_keys.add(key)
+        snap_route = snap_by_key.get(key)
+        if snap_route:
+            merged = _merge_stops(route, snap_route)
+            if merged:
+                _log(f"Merged {merged} snap stop(s) into '{route.line_name}'")
+        merged_routes.append(route)
+
+    # Add purely new routes (non-pulled features)
+    snap_added = 0
+    for key, r in snap_by_key.items():
+        if key not in reconstructed_keys:
+            merged_routes.append(r)
+            snap_added += 1
+            _log(f"Snap-generated route '{r.line_name}': "
+                 f"{len(r.stops)} total stops "
+                 f"({r.active_stop_count} intermediate)")
+
+    if snap_added:
+        _log(f"reconstruct_routes: added {snap_added} new route(s) "
+             f"via snapping")
+
+    return merged_routes
+
+
+def _merge_stops(recon_route: Route, snap_route: Route) -> int:
+    """Merge snap-discovered intermediate stops into a reconstructed route.
+
+    Adds any intermediate stops from *snap_route* that aren't already
+    present in *recon_route* (matched by point_feature_id).  New stops
+    are inserted in the order the snapping generator discovered them
+    (sorted by distance along the line), placed before the destination.
+
+    Returns the number of stops added.
+    """
+    # Existing point feature IDs in the reconstructed route
+    existing: set = set()
+    for s in recon_route.stops:
+        if s.point_feature_id >= 0:
+            existing.add((s.point_layer_id, s.point_feature_id))
+
+    # Collect new intermediate stops from snapping
+    new_stops = [
+        s for s in snap_route.stops
+        if not s.is_endpoint
+        and s.point_feature_id >= 0
+        and (s.point_layer_id, s.point_feature_id) not in existing
+    ]
+
+    if not new_stops:
+        return 0
+
+    # Renumber: find the highest existing stop_number, continue from there
+    max_num = max((s.stop_number for s in recon_route.stops), default=0)
+    for s in new_stops:
+        max_num += 1
+        s.stop_number = max_num
+
+    # Insert before the destination (last stop)
+    dest_idx = len(recon_route.stops)
+    for i, s in enumerate(recon_route.stops):
+        if s.stop_type == StopType.DESTINATION:
+            dest_idx = i
+            break
+
+    for s in new_stops:
+        recon_route.stops.insert(dest_idx, s)
+        dest_idx += 1
+
+    return len(new_stops)
 
 
 def _find_point(
@@ -723,13 +827,18 @@ def _category_field_names(
     fmap: Dict[str, str],
 ) -> List[str]:
     """Return the extra field names (beyond essentials) for a category."""
+    # Exclude names already in the essential list to avoid duplicates
+    essential = set(
+        _LINE_ESSENTIAL if geom_type == "line" else _POINT_ESSENTIAL
+    )
+
     names: List[str] = []
     seen: set = set()
 
     # Add fields from the reverse map
     for key in sorted(fmap.keys()):
         name = fmap[key]
-        if name not in seen:
+        if name not in seen and name not in essential:
             names.append(name)
             seen.add(name)
 
@@ -964,6 +1073,23 @@ def _create_memory_layer(
          f"requested={len(remapped)}, added={len(added)}, "
          f"provider={dp.featureCount()}")
     layer.updateExtents()
+
+    # Hide internal tracking fields (prefixed with '_') from the
+    # attribute table and form so pulled layers look clean to the user.
+    from qgis.core import QgsEditorWidgetSetup, QgsAttributeTableConfig
+    hidden = QgsEditorWidgetSetup("Hidden", {})
+    for i in range(layer.fields().count()):
+        if layer.fields().at(i).name().startswith("_"):
+            layer.setEditorWidgetSetup(i, hidden)
+
+    # Also hide from the attribute table view
+    atc = layer.attributeTableConfig()
+    columns = atc.columns()
+    for col in columns:
+        if col.name.startswith("_"):
+            col.hidden = True
+    atc.setColumns(columns)
+    layer.setAttributeTableConfig(atc)
 
     return layer
 

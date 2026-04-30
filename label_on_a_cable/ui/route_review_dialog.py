@@ -337,17 +337,49 @@ class RouteReviewDialog(QDialog):
         if route.has_edits:
             return "Modified"
 
-        # Check if route was pulled from server (feature has _loc_id)
+        # Check if route exists on the server — either pulled (layer field)
+        # or previously pushed (sidecar stamp cache, scoped by location).
         if route.line_layer_id:
             project = QgsProject.instance()
             layer = project.mapLayer(route.line_layer_id)
             if isinstance(layer, QgsVectorLayer):
+                has_stamp = False
+                cached_stop_count = -1
+
+                # Pulled memory layers have valid _loc_id as a field
                 if "_loc_id" in layer.fields().names():
                     feat = layer.getFeature(route.line_feature_id)
                     if feat.isValid():
                         loc_id = feat.attribute("_loc_id")
-                        if loc_id:
-                            return "No changes"
+                        if loc_id and len(str(loc_id)) == 36:
+                            has_stamp = True
+
+                # Sidecar stamp cache (for Shapefile layers after push)
+                if not has_stamp:
+                    from ..core.export_builder import _get_stamp_value
+                    cached = _get_stamp_value(
+                        layer, route.line_feature_id, "_loc_id")
+                    if cached:
+                        has_stamp = True
+
+                if has_stamp:
+                    # Compare stop count to detect structural changes
+                    from ..core.export_builder import _get_stamp_value
+                    stop_ids_raw = _get_stamp_value(
+                        layer, route.line_feature_id, "_stop_ids")
+                    if stop_ids_raw:
+                        cached_stop_count = len([
+                            s for s in stop_ids_raw.split(",")
+                            if len(s) == 36
+                        ])
+                    else:
+                        # No cached stops — route had 0 stops last push
+                        cached_stop_count = 0
+
+                    current_stops = len(route.intermediate_stops)
+                    if cached_stop_count != current_stops:
+                        return "Modified"
+                    return "No changes"
 
         return "New"
 

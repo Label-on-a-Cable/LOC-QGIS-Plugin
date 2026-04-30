@@ -28,8 +28,10 @@ All coordinates are WGS 84 (EPSG:4326).
 All IDs are v4 UUIDs.
 """
 
+import hashlib as _hashlib
 import json as _json
 import os
+import pathlib as _pathlib
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -61,42 +63,10 @@ _DUAL_ORIGIN_KNOWN = {"route id", "origin", "unique asset identifier",
 _DUAL_DEST_KNOWN = {"destination"}
 
 
-# ------------------------------------------------------------------
-# Type-normalizing comparison helpers
-# ------------------------------------------------------------------
-
-def _norm_val(v) -> str:
-    """Normalize a value for comparison: stringify, treat null/N-A/empty as sentinel."""
-    if v is None:
-        return ""
-    s = str(v).strip()
-    if s in ("N/A", "NULL", "None", ""):
-        return ""
-    return s
-
-
-def _norm_coord(v) -> float:
-    """Normalize a coordinate value to float for comparison."""
-    try:
-        return round(float(v), 8)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _fields_equal(a: dict, b: dict) -> bool:
-    """Compare two field dicts with type-normalized values.
-
-    Handles raw JSON types (int, float, null) vs QGIS string types.
-    """
-    if a is None and b is None:
-        return True
-    a = a or {}
-    b = b or {}
-    all_keys = set(a.keys()) | set(b.keys())
-    for k in all_keys:
-        if _norm_val(a.get(k)) != _norm_val(b.get(k)):
-            return False
-    return True
+def _fields_fingerprint(*values) -> str:
+    """Compute a short hash of field values for change detection."""
+    raw = _json.dumps(values, sort_keys=True, default=str)
+    return _hashlib.md5(raw.encode()).hexdigest()
 
 
 # ------------------------------------------------------------------
@@ -121,6 +91,14 @@ def build_payload(
     project = QgsProject.instance()
     now = _now_iso()
 
+    global _active_location_id, _current_stamp_layer
+    _active_location_id = location.location_id
+    _current_stamp_layer = None
+
+    # Re-key stamp cache entries if memory layer UIDs changed
+    # (e.g. after route regeneration).
+    _migrate_stamps_for_routes(routes, location.location_id)
+
     mapping_by_layer: Dict[str, LayerMapping] = {
         lm.layer_id: lm for lm in layer_mappings
         if lm.enabled_for_export
@@ -129,6 +107,9 @@ def build_payload(
 
     multi_locs: List[dict] = []
     dual_locs_list: List[dict] = []
+    # Maps payload entries back to layer features for post-push ID sync.
+    # Each entry: {"layer_id": str, "feature_id": int, "type": "multi"|"dual"}
+    _feature_map: List[dict] = []
 
     for route in routes:
         line_mapping = mapping_by_layer.get(route.line_layer_id)
@@ -146,6 +127,13 @@ def build_payload(
             route, project, transforms,
         )
 
+        # _route_endpoint_coords calls _get_feature on point layers,
+        # which overwrites _current_stamp_layer.  Restore the line
+        # layer so _build_dual_loc_obj looks up the right cache entry.
+        _line_layer = project.mapLayer(route.line_layer_id)
+        if isinstance(_line_layer, QgsVectorLayer):
+            _set_current_layer(_line_layer)
+
         dual_loc = _build_dual_loc_obj(
             route, line_feature, line_mapping, line_cat,
             origin_xy, dest_xy,
@@ -153,10 +141,14 @@ def build_payload(
         )
 
         intermediates = route.intermediate_stops
+        fmap_entry = {"layer_id": route.line_layer_id,
+                      "feature_id": route.line_feature_id}
         if not intermediates:
             # 0 stops → standalone dual_loc
             # Always include — server deletes LOCs not in the push.
             dual_locs_list.append(dual_loc)
+            _feature_map.append({**fmap_entry, "type": "dual",
+                                 "index": len(dual_locs_list) - 1})
         else:
             # ≥1 stop → multiLoc
             multi_id = ""
@@ -185,24 +177,34 @@ def build_payload(
 
                 # Always include — server deletes LOCs not in the push.
                 multi_locs.append(mloc_entry)
+                _feature_map.append({**fmap_entry, "type": "multi",
+                                     "index": len(multi_locs) - 1})
             else:
                 # From-scratch path (locally created features)
                 stop_cat = categories.get(line_mapping.stop_category_id)
                 route_uid = dual_loc.get("unique_asset_id", route.line_name)
 
-                # Parse coord→ID map from pulled line feature so we can
-                # reuse original server IDs for unchanged stops.
+                # Parse coord→ID map so we can reuse original server IDs
+                # for stops at unchanged coordinates.
                 stop_id_map: dict = {}
-                orig_stop_ids: List[str] = []
+                cached_stop_count = 0
                 if line_feature is not None:
                     raw_ids = _safe_value(line_feature, "_stop_loc_ids")
                     if raw_ids:
                         stop_id_map = _parse_stop_loc_ids(raw_ids)
-                    raw_stop_ids = _safe_value(line_feature, "_stop_ids")
-                    if raw_stop_ids:
-                        orig_stop_ids = raw_stop_ids.split(",")
+                        # Count cached stops to detect adds/removes
+                        cached_stop_count = len(raw_ids.split("|"))
+
+                # If stop count changed and cache lacks per-stop numbers
+                # (old format), bump ALL stop timestamps in this route so
+                # the server reprocesses renumbered entries.
+                force_bump_ts = (
+                    cached_stop_count > 0
+                    and cached_stop_count != len(intermediates)
+                )
 
                 stops_arr: List[dict] = []
+                _matched = 0
                 for idx, stop in enumerate(intermediates, start=1):
                     pt_mapping = mapping_by_layer.get(stop.point_layer_id)
                     pt_feature = _get_feature(
@@ -219,12 +221,21 @@ def build_payload(
                         location.location_id, user_id, now,
                         stop_id_map=stop_id_map,
                     )
-                    # Reuse original stop_id if available (round-trip)
-                    sid = (orig_stop_ids[idx - 1]
-                           if idx - 1 < len(orig_stop_ids)
-                           else str(uuid4()))
+                    # Force-bump updatedAt if stop count changed and the
+                    # per-stop orig_stop_num check didn't already fire
+                    # (backward compat with old cache format).
+                    if force_bump_ts:
+                        single_loc["updatedAt"] = now
+
+                    # Reuse stop_id by coordinate match (from stamp cache
+                    # or pulled data). Fresh UUID only for genuinely new stops.
+                    sid = single_loc.pop("_matched_stop_id", "")
+                    if sid:
+                        _matched += 1
+                    else:
+                        sid = str(uuid4())
                     stops_arr.append({
-                        "stop_id": sid or str(uuid4()),
+                        "stop_id": sid,
                         "stopNumber": idx,
                         "singleLoc": single_loc,
                     })
@@ -235,12 +246,15 @@ def build_payload(
                     "Stops": stops_arr,
                     "dualLoc": dual_loc,
                 })
+                _feature_map.append({**fmap_entry, "type": "multi",
+                                     "index": len(multi_locs) - 1})
 
     # Standalone single LOCs — point features from single-type categories
-    single_locs_list = _build_standalone_single_locs(
+    single_locs_list, single_fmap = _build_standalone_single_locs(
         project, layer_mappings, categories, transforms,
         location.location_id, user_id, now,
     )
+    _feature_map.extend(single_fmap)
 
     payload = {
         "location_id": location.location_id,
@@ -254,6 +268,9 @@ def build_payload(
             "name": location.name,
             "is_update": True,
         },
+        # Internal: maps payload entries → layer features for post-push sync.
+        # Stripped before sending to server.
+        "_feature_map": _feature_map,
     }
 
     return payload
@@ -281,6 +298,298 @@ def payload_summary(payload: dict) -> dict:
         "standalone_assets": len(single),
         "total_locs": total_locs,
     }
+
+
+def stamp_ids_after_push(payload: dict) -> int:
+    """Write payload IDs to a sidecar JSON cache after a successful push.
+
+    Uses the ``_feature_map`` built during ``build_payload()`` to match
+    payload entries to their source layer features, then saves the
+    generated UUIDs and raw JSON to ``~/.loc_stamp_cache.json`` so
+    subsequent pushes treat them as updates rather than creates.
+
+    This avoids modifying source layers (Shapefiles have field-name and
+    field-length limits that truncate UUIDs/JSON).
+
+    Returns the number of features stamped.
+    """
+    feature_map = payload.get("_feature_map", [])
+    if not feature_map:
+        return 0
+
+    location_id = payload.get("location_id", "")
+    if not location_id:
+        return 0
+
+    global _active_location_id
+    _active_location_id = location_id
+
+    project = QgsProject.instance()
+    multi_locs = payload.get("multiLocs", [])
+    dual_locs = payload.get("dual_locs", [])
+    single_locs = payload.get("single_locs", [])
+
+    cache = _load_stamp_cache()
+    loc_stamps = cache.setdefault(location_id, {})
+    stamped = 0
+
+    for fm in feature_map:
+        layer = project.mapLayer(fm["layer_id"])
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+
+        fid = fm["feature_id"]
+        feat = layer.getFeature(fid)
+        if not feat.isValid():
+            continue
+
+        entry_type = fm["type"]
+        idx = fm["index"]
+        cache_key = _stamp_cache_key(layer, fid)
+        entry: Dict[str, str] = {}
+
+        if entry_type == "multi" and idx < len(multi_locs):
+            mloc = multi_locs[idx]
+            dloc = mloc.get("dualLoc", {})
+            dest = dloc.get("LOCDestination", {})
+
+            entry["_loc_id"] = dloc.get("loc_id", "")
+            entry["_origin_id"] = dloc.get("origin_id", "")
+            entry["_dest_id"] = dest.get("destination_id", "")
+            entry["_multi_id"] = mloc.get("id", "")
+            entry["_route_name"] = mloc.get("multiName", "")
+            # Preserve timestamps so server skips reprocessing unchanged entries
+            entry["_createdAt"] = dloc.get("createdAt", "")
+            entry["_updatedAt"] = dloc.get("updatedAt", "")
+            entry["_dest_createdAt"] = dest.get("createdAt", "")
+            entry["_dest_updatedAt"] = dest.get("updatedAt", "")
+
+            entry["_fields_hash"] = _fields_fingerprint(
+                dloc.get("fields", {}),
+                dest.get("destination_fields", {}),
+                dloc.get("unique_asset_id", ""),
+                dloc.get("actual_asset_name", ""),
+                dest.get("destination", ""),
+            )
+
+            # Cache stop IDs so they can be reused on re-push
+            stops = mloc.get("Stops", [])
+            entry["_stop_ids"] = ",".join(
+                s.get("stop_id", "") for s in stops
+            )
+
+            stop_loc_parts = []
+            for s in stops:
+                sl = s.get("singleLoc", {})
+                slid = sl.get("loc_id", "")
+                sloid = sl.get("origin_id", "")
+                slon = sl.get("origin_longitude", "")
+                slat = sl.get("origin_latitude", "")
+                sid = s.get("stop_id", "")
+                sl_ca = sl.get("createdAt", "")
+                sl_ua = sl.get("updatedAt", "")
+                snum = s.get("stopNumber", "")
+                if slid and slon and slat:
+                    key = f"{round(float(slon), 8)},{round(float(slat), 8)}"
+                    stop_loc_parts.append(
+                        f"{key}={slid},{sloid},{slon},{slat},{sid},{sl_ca},{sl_ua},{snum}"
+                    )
+            if stop_loc_parts:
+                entry["_stop_loc_ids"] = "|".join(stop_loc_parts)
+
+        elif entry_type == "dual" and idx < len(dual_locs):
+            dloc = dual_locs[idx]
+            dest = dloc.get("LOCDestination", {})
+            entry["_loc_id"] = dloc.get("loc_id", "")
+            entry["_origin_id"] = dloc.get("origin_id", "")
+            entry["_dest_id"] = dest.get("destination_id", "")
+            entry["_createdAt"] = dloc.get("createdAt", "")
+            entry["_updatedAt"] = dloc.get("updatedAt", "")
+            entry["_dest_createdAt"] = dest.get("createdAt", "")
+            entry["_dest_updatedAt"] = dest.get("updatedAt", "")
+            entry["_fields_hash"] = _fields_fingerprint(
+                dloc.get("fields", {}),
+                dest.get("destination_fields", {}),
+                dloc.get("unique_asset_id", ""),
+                dloc.get("actual_asset_name", ""),
+                dest.get("destination", ""),
+            )
+
+        elif entry_type == "single" and idx < len(single_locs):
+            sloc = single_locs[idx]
+            attrs = sloc.get("attributes", {})
+            entry["_loc_id"] = attrs.get("loc_id", "")
+            entry["_origin_id"] = attrs.get("origin_id", "")
+            entry["_createdAt"] = attrs.get("createdAt", "")
+            entry["_updatedAt"] = attrs.get("updatedAt", "")
+            entry["_wrapper_id"] = sloc.get("id", "")
+            entry["_fields_hash"] = _fields_fingerprint(
+                attrs.get("fields", {}),
+                attrs.get("unique_asset_id", ""),
+                attrs.get("actual_asset_name", ""),
+            )
+
+        if entry:
+            loc_stamps[cache_key] = entry
+            stamped += 1
+
+    _save_stamp_cache(cache)
+
+    QgsMessageLog.logMessage(
+        f"stamp_ids_after_push: cached {stamped} feature(s)",
+        "LOC Export", Qgis.Info,
+    )
+    return stamped
+
+
+# ---------------------------------------------------------------------------
+# Stamp cache — sidecar JSON stored next to the QGIS project file
+# (e.g. MyProject.qgz → MyProject_loc_stamps.json)
+#
+# Structure:  { location_id: { "layer_source:fid": { field: value } } }
+# Scoped by location_id so stamps from Location A don't leak into Location B.
+# ---------------------------------------------------------------------------
+
+_stamp_cache: Optional[Dict[str, dict]] = None  # full file contents
+_stamp_cache_path: Optional[_pathlib.Path] = None  # resolved per-project
+_active_location_id: str = ""  # set by build_payload / stamp_ids_after_push
+
+
+def _get_stamp_cache_path() -> Optional[_pathlib.Path]:
+    """Return the stamp cache path derived from the current QGIS project file.
+
+    Returns None if the project hasn't been saved yet.
+    """
+    global _stamp_cache_path
+    project_path = QgsProject.instance().absoluteFilePath()
+    if not project_path:
+        return None
+    p = _pathlib.Path(project_path)
+    new_path = p.parent / f"{p.stem}_loc_stamps.json"
+    if _stamp_cache_path != new_path:
+        # Project changed — invalidate in-memory cache
+        global _stamp_cache
+        _stamp_cache = None
+        _stamp_cache_path = new_path
+    return new_path
+
+
+def _stamp_cache_key(layer: QgsVectorLayer, fid: int) -> str:
+    """Build a stable cache key from the layer's data source and feature ID."""
+    return f"{layer.source()}:{fid}"
+
+
+def _migrate_stamps_for_routes(
+    routes: List["Route"],
+    location_id: str,
+) -> int:
+    """Re-key stamp cache entries after route regeneration.
+
+    Memory layer UIDs change when routes are regenerated, breaking the
+    primary cache key (layer.source():fid).  This scans cached entries
+    for a ``_route_name`` field and copies them under the new key so
+    subsequent ``_safe_value`` lookups succeed.
+
+    Returns the number of entries migrated.
+    """
+    cache = _load_stamp_cache()
+    loc_stamps = cache.get(location_id)
+    if not loc_stamps:
+        return 0
+
+    project = QgsProject.instance()
+
+    # Build reverse index: route_name → (old_key, entry)
+    by_route_name: Dict[str, tuple] = {}
+    for old_key, entry in loc_stamps.items():
+        rname = entry.get("_route_name", "")
+        if rname:
+            by_route_name[rname] = (old_key, entry)
+
+    if not by_route_name:
+        return 0
+
+    migrated = 0
+    for route in routes:
+        layer = project.mapLayer(route.line_layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+        new_key = _stamp_cache_key(layer, route.line_feature_id)
+
+        # Check if the existing entry (if any) belongs to THIS route.
+        # After Shapefile FID renumbering, FID N may now point to a
+        # different route's cache entry.
+        existing = loc_stamps.get(new_key, {})
+        if existing.get("_route_name") == route.line_name:
+            continue  # Correctly linked — no migration needed
+
+        old_entry = by_route_name.get(route.line_name)
+        if old_entry is None:
+            continue
+        _, entry = old_entry
+        loc_stamps[new_key] = entry
+        migrated += 1
+
+    if migrated:
+        _save_stamp_cache(cache)
+        QgsMessageLog.logMessage(
+            f"Migrated {migrated} stamp cache entries to current layers",
+            "LOC Export", Qgis.Info,
+        )
+    return migrated
+
+
+def _load_stamp_cache() -> Dict[str, dict]:
+    """Load the full stamp cache from disk (or return the in-memory copy)."""
+    global _stamp_cache
+    if _stamp_cache is not None:
+        return _stamp_cache
+    path = _get_stamp_cache_path()
+    if path is not None and path.exists():
+        try:
+            _stamp_cache = _json.loads(path.read_text("utf-8"))
+            if not isinstance(_stamp_cache, dict):
+                _stamp_cache = {}
+        except Exception:
+            _stamp_cache = {}
+    else:
+        _stamp_cache = {}
+    return _stamp_cache
+
+
+def _save_stamp_cache(cache: Dict[str, dict]) -> None:
+    """Persist the stamp cache to disk next to the project file."""
+    global _stamp_cache
+    _stamp_cache = cache
+    path = _get_stamp_cache_path()
+    if path is None:
+        QgsMessageLog.logMessage(
+            "Cannot save stamp cache: QGIS project not saved yet. "
+            "Save the project first so LOC IDs persist across sessions.",
+            "LOC Export", Qgis.Warning,
+        )
+        return
+    try:
+        path.write_text(
+            _json.dumps(cache, default=str), "utf-8",
+        )
+    except Exception as exc:
+        QgsMessageLog.logMessage(
+            f"Failed to save stamp cache: {exc}",
+            "LOC Export", Qgis.Warning,
+        )
+
+
+def _get_stamp_value(layer: QgsVectorLayer, fid: int,
+                     field_name: str) -> str:
+    """Look up a stamped value from the sidecar cache for the active location."""
+    if not _active_location_id:
+        return ""
+    cache = _load_stamp_cache()
+    loc_stamps = cache.get(_active_location_id, {})
+    key = _stamp_cache_key(layer, fid)
+    entry = loc_stamps.get(key, {})
+    return entry.get(field_name, "")
 
 
 def validate_payload(
@@ -504,6 +813,13 @@ def _build_dual_loc_obj(
     origin_id = _get_tracking_id(line_feature, "_origin_id")
     dest_id = _get_tracking_id(line_feature, "_dest_id")
 
+    # Preserve timestamps from stamp cache so server skips reprocessing
+    # unchanged entries.  Fresh `now` only for genuinely new entries.
+    cached_ca = _safe_value(line_feature, "_createdAt") if line_feature else ""
+    cached_ua = _safe_value(line_feature, "_updatedAt") if line_feature else ""
+    cached_dca = _safe_value(line_feature, "_dest_createdAt") if line_feature else ""
+    cached_dua = _safe_value(line_feature, "_dest_updatedAt") if line_feature else ""
+
     # Numbered fields for origin side
     # Top-level keys are field_N; sub-dict uses human-readable names.
     cat_fields = category.fields if category else []
@@ -544,6 +860,17 @@ def _build_dual_loc_obj(
     if not destination:
         destination = route.destination
 
+    # Bump timestamps if field values changed since last push
+    cached_hash = _safe_value(line_feature, "_fields_hash") if line_feature else ""
+    if cached_hash:
+        current_hash = _fields_fingerprint(
+            origin_sub, dest_sub,
+            unique_asset_id, actual_asset_name, destination,
+        )
+        if current_hash != cached_hash:
+            cached_ua = now
+            cached_dua = now
+
     entry = {
         "loc_id": loc_id,
         "unique_asset_id": unique_asset_id,
@@ -564,8 +891,8 @@ def _build_dual_loc_obj(
         "origin_latitude": origin_xy[1],
         "origin_radius": None,
         "transaction_id": None,
-        "createdAt": now,
-        "updatedAt": now,
+        "createdAt": cached_ca or now,
+        "updatedAt": cached_ua or now,
         "location_id": location_id,
         "user_id": user_id,
         "LOCDestination": {
@@ -579,8 +906,8 @@ def _build_dual_loc_obj(
             "hard_lock": 0,
             "destination_transaction_id": None,
             "destination_fields": dest_sub,
-            "createdAt": now,
-            "updatedAt": now,
+            "createdAt": cached_dca or now,
+            "updatedAt": cached_dua or now,
         },
         "category_name": mapping.category_name,
         "category_type": "dual",
@@ -633,6 +960,10 @@ def _build_single_loc_obj(
     origin_id = ""
     exact_lon = 0.0
     exact_lat = 0.0
+    matched_stop_id = ""
+    matched_created_at = ""
+    matched_updated_at = ""
+    orig_stop_num = 0
     if stop_id_map:
         coord_key = (round(pt_xy[0], 8), round(pt_xy[1], 8))
         id_list = stop_id_map.get(coord_key)
@@ -642,6 +973,10 @@ def _build_single_loc_obj(
             origin_id = entry[1] if len(entry) > 1 else ""
             exact_lon = entry[2] if len(entry) > 2 else 0.0
             exact_lat = entry[3] if len(entry) > 3 else 0.0
+            matched_stop_id = entry[4] if len(entry) > 4 else ""
+            matched_created_at = entry[5] if len(entry) > 5 else ""
+            matched_updated_at = entry[6] if len(entry) > 6 else ""
+            orig_stop_num = entry[7] if len(entry) > 7 else 0
     if not loc_id:
         loc_id = str(uuid4())
     if not origin_id:
@@ -705,8 +1040,10 @@ def _build_single_loc_obj(
         "origin_latitude": pt_xy[1],
         "origin_radius": None,
         "transaction_id": None,
-        "createdAt": now,
-        "updatedAt": now,
+        "createdAt": matched_created_at or now,
+        # Bump updatedAt when stopNumber changed (signals server to reprocess)
+        "updatedAt": (now if (orig_stop_num and orig_stop_num != stop_number)
+                      else (matched_updated_at or now)),
         "location_id": location_id,
         "user_id": user_id,
         "category_name": cat_name,
@@ -716,6 +1053,10 @@ def _build_single_loc_obj(
 
     # Merge numbered top-level field keys
     entry.update(top_fields)
+
+    # Stash matched stop_id for caller (stripped before sending to server)
+    if matched_stop_id:
+        entry["_matched_stop_id"] = matched_stop_id
 
     return entry
 
@@ -732,10 +1073,14 @@ def _build_standalone_single_locs(
     location_id: str,
     user_id: str,
     now: str,
-) -> List[dict]:
+) -> Tuple[List[dict], List[dict]]:
     """Build single_locs entries for every feature in point layers
-    mapped to single-type categories."""
+    mapped to single-type categories.
+
+    Returns (entries, feature_map).
+    """
     entries: List[dict] = []
+    fmap: List[dict] = []
 
     for lm in layer_mappings:
         if not lm.enabled_for_export:
@@ -758,6 +1103,7 @@ def _build_standalone_single_locs(
         name_qfield = lm.qgis_field_for("Actual Asset Name")
         fallback_qfield = lm.first_mapped_qgis_field()
 
+        _set_current_layer(layer)
         for feat in layer.getFeatures():
             if not feat.isValid():
                 continue
@@ -774,8 +1120,9 @@ def _build_standalone_single_locs(
                 # Always include in payload — server deletes LOCs not
                 # present in the push.  updatedAt is preserved from raw
                 # JSON so the server won't reprocess unchanged entries.
-                _sloc_unchanged(raw_sloc, result["attributes"])  # diagnostic log only
                 entries.append(result)
+                fmap.append({"layer_id": lm.layer_id, "feature_id": feat.id(),
+                             "type": "single", "index": len(entries) - 1})
                 continue
 
             unique_asset_id = _safe_value(feat, uid_qfield) if uid_qfield else ""
@@ -794,6 +1141,18 @@ def _build_standalone_single_locs(
 
             loc_id = _get_tracking_id(feat, "_loc_id")
             origin_id = _get_tracking_id(feat, "_origin_id")
+            sl_ca = _safe_value(feat, "_createdAt") or now
+            sl_ua = _safe_value(feat, "_updatedAt") or now
+            wrapper_id = _safe_value(feat, "_wrapper_id") or str(uuid4())
+
+            # Bump timestamp if field values changed since last push
+            cached_hash = _safe_value(feat, "_fields_hash")
+            if cached_hash:
+                current_hash = _fields_fingerprint(
+                    sub_fields, unique_asset_id, actual_asset_name,
+                )
+                if current_hash != cached_hash:
+                    sl_ua = now
 
             # Minimal attributes matching the old plugin's format.
             # Server processes single_locs through a separate code path
@@ -812,11 +1171,13 @@ def _build_standalone_single_locs(
                 "category_id": lm.category_id,
                 "category_name": lm.category_name,
                 "category_type": "single",
+                "createdAt": sl_ca,
+                "updatedAt": sl_ua,
             }
             attrs.update(top_fields)
 
             entries.append({
-                "id": str(uuid4()),
+                "id": wrapper_id,
                 "category": lm.category_id,
                 "coordinates": [pt_xy[0], pt_xy[1]],
                 "unique_asset_id": unique_asset_id,
@@ -825,8 +1186,10 @@ def _build_standalone_single_locs(
                 "fields": sub_fields,
                 "attributes": attrs,
             })
+            fmap.append({"layer_id": lm.layer_id, "feature_id": feat.id(),
+                         "type": "single", "index": len(entries) - 1})
 
-    return entries
+    return entries, fmap
 
 
 # ------------------------------------------------------------------
@@ -894,9 +1257,21 @@ def _patch_standalone_sloc(
     patched["unique_asset_id"] = unique_asset_id
     patched["actual_asset_name"] = actual_asset_name
 
-    # Preserve original updatedAt from server — only the server should
-    # update this timestamp.  Changing it causes the server to reprocess
-    # every entry even when nothing else differs, leading to timeouts.
+    # Bump updatedAt if any user-editable value actually changed.
+    # Coordinates are already handled above (only overwritten on real move).
+    # Check fields sub-dict and identity fields against the raw original.
+    _changed = False
+    if (patched.get("origin_longitude") != raw_sloc.get("origin_longitude")
+            or patched.get("origin_latitude") != raw_sloc.get("origin_latitude")):
+        _changed = True
+    if patched.get("unique_asset_id") != raw_sloc.get("unique_asset_id"):
+        _changed = True
+    if patched.get("actual_asset_name") != raw_sloc.get("actual_asset_name"):
+        _changed = True
+    if patched.get("fields") != raw_sloc.get("fields"):
+        _changed = True
+    if _changed:
+        patched["updatedAt"] = now
 
     # Push endpoint expects "category_id" (not "category") for single_locs.
     # The fetch response uses "category"; ensure the push-required key exists.
@@ -907,8 +1282,10 @@ def _patch_standalone_sloc(
     if location_id:
         patched["location_id"] = location_id
 
+    wrapper_id = _safe_value(feat, "_wrapper_id") or str(uuid4())
+
     return {
-        "id": str(uuid4()),
+        "id": wrapper_id,
         "category": lm.category_id,
         "coordinates": [pt_xy[0], pt_xy[1]],
         "unique_asset_id": unique_asset_id,
@@ -917,64 +1294,6 @@ def _patch_standalone_sloc(
         "fields": patched.get("fields", {}),
         "attributes": patched,
     }
-
-
-def _sloc_unchanged(raw: dict, patched: dict) -> bool:
-    """Return True if no user-editable values changed on a singleLoc.
-
-    Uses type-normalized comparisons so that raw JSON types (int, float,
-    null) compare equal to their QGIS string equivalents ("42", "N/A").
-    """
-    # Coordinates: compare as floats (handles "-6.123" vs -6.123)
-    if _norm_coord(raw.get("origin_longitude")) != _norm_coord(patched.get("origin_longitude")):
-        QgsMessageLog.logMessage(
-            f"singleLoc changed: origin_longitude "
-            f"{raw.get('origin_longitude')!r} → {patched.get('origin_longitude')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-    if _norm_coord(raw.get("origin_latitude")) != _norm_coord(patched.get("origin_latitude")):
-        QgsMessageLog.logMessage(
-            f"singleLoc changed: origin_latitude "
-            f"{raw.get('origin_latitude')!r} → {patched.get('origin_latitude')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Identity fields: compare as normalized strings
-    if _norm_val(raw.get("unique_asset_id")) != _norm_val(patched.get("unique_asset_id")):
-        QgsMessageLog.logMessage(
-            f"singleLoc changed: unique_asset_id "
-            f"{raw.get('unique_asset_id')!r} → {patched.get('unique_asset_id')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-    if _norm_val(raw.get("actual_asset_name")) != _norm_val(patched.get("actual_asset_name")):
-        QgsMessageLog.logMessage(
-            f"singleLoc changed: actual_asset_name "
-            f"{raw.get('actual_asset_name')!r} → {patched.get('actual_asset_name')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Fields sub-dict: compare key-by-key with normalization
-    if not _fields_equal(raw.get("fields"), patched.get("fields")):
-        QgsMessageLog.logMessage(
-            f"singleLoc changed: fields sub-dict differs",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Top-level field_N values
-    for k in raw:
-        if k.startswith("field_") and _norm_val(raw[k]) != _norm_val(patched.get(k)):
-            QgsMessageLog.logMessage(
-                f"singleLoc changed: {k} "
-                f"{raw[k]!r} → {patched.get(k)!r}",
-                "LOC", Qgis.Info,
-            )
-            return False
-    return True
 
 
 def _patch_dual_loc(
@@ -1088,7 +1407,30 @@ def _patch_dual_loc(
     if isinstance(patched["LOCDestination"], dict):
         patched["LOCDestination"]["destination"] = destination
 
-    # Preserve original updatedAt — only the server should bump this.
+    # Bump updatedAt if any user-editable value actually changed.
+    _changed = False
+    if (patched.get("origin_longitude") != raw.get("origin_longitude")
+            or patched.get("origin_latitude") != raw.get("origin_latitude")):
+        _changed = True
+    if patched.get("unique_asset_id") != raw.get("unique_asset_id"):
+        _changed = True
+    if patched.get("actual_asset_name") != raw.get("actual_asset_name"):
+        _changed = True
+    if patched.get("fields") != raw.get("fields"):
+        _changed = True
+    raw_dest = raw.get("LOCDestination") or {}
+    pat_dest = patched.get("LOCDestination") or {}
+    if (pat_dest.get("longitude") != raw_dest.get("longitude")
+            or pat_dest.get("latitude") != raw_dest.get("latitude")):
+        _changed = True
+    if pat_dest.get("destination") != raw_dest.get("destination"):
+        _changed = True
+    if pat_dest.get("destination_fields") != raw_dest.get("destination_fields"):
+        _changed = True
+    if _changed:
+        patched["updatedAt"] = now
+        if isinstance(patched.get("LOCDestination"), dict):
+            patched["LOCDestination"]["updatedAt"] = now
 
     # Ensure push-required keys are present (from-scratch path sets these)
     patched["category"] = mapping.category_id
@@ -1099,126 +1441,6 @@ def _patch_dual_loc(
         patched["location_id"] = location_id
 
     return patched
-
-
-def _dloc_unchanged(raw: dict, patched: dict) -> bool:
-    """Return True if no user-editable values changed on a dualLoc.
-
-    Uses type-normalized comparisons so that raw JSON types (int, float,
-    null) compare equal to their QGIS string equivalents ("42", "N/A").
-    """
-    # Origin coordinates
-    if _norm_coord(raw.get("origin_longitude")) != _norm_coord(patched.get("origin_longitude")):
-        QgsMessageLog.logMessage(
-            f"dualLoc changed: origin_longitude "
-            f"{raw.get('origin_longitude')!r} → {patched.get('origin_longitude')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-    if _norm_coord(raw.get("origin_latitude")) != _norm_coord(patched.get("origin_latitude")):
-        QgsMessageLog.logMessage(
-            f"dualLoc changed: origin_latitude "
-            f"{raw.get('origin_latitude')!r} → {patched.get('origin_latitude')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Identity fields
-    if _norm_val(raw.get("unique_asset_id")) != _norm_val(patched.get("unique_asset_id")):
-        QgsMessageLog.logMessage(
-            f"dualLoc changed: unique_asset_id "
-            f"{raw.get('unique_asset_id')!r} → {patched.get('unique_asset_id')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-    if _norm_val(raw.get("actual_asset_name")) != _norm_val(patched.get("actual_asset_name")):
-        QgsMessageLog.logMessage(
-            f"dualLoc changed: actual_asset_name "
-            f"{raw.get('actual_asset_name')!r} → {patched.get('actual_asset_name')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Origin fields sub-dict
-    if not _fields_equal(raw.get("fields"), patched.get("fields")):
-        QgsMessageLog.logMessage(
-            "dualLoc changed: origin fields sub-dict differs",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Top-level field_N values
-    for k in raw:
-        if k.startswith("field_") and _norm_val(raw[k]) != _norm_val(patched.get(k)):
-            QgsMessageLog.logMessage(
-                f"dualLoc changed: {k} "
-                f"{raw[k]!r} → {patched.get(k)!r}",
-                "LOC", Qgis.Info,
-            )
-            return False
-
-    # Destination side
-    raw_dest = raw.get("LOCDestination") or {}
-    pat_dest = patched.get("LOCDestination") or {}
-
-    if _norm_coord(raw_dest.get("longitude")) != _norm_coord(pat_dest.get("longitude")):
-        QgsMessageLog.logMessage(
-            f"dualLoc changed: dest longitude "
-            f"{raw_dest.get('longitude')!r} → {pat_dest.get('longitude')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-    if _norm_coord(raw_dest.get("latitude")) != _norm_coord(pat_dest.get("latitude")):
-        QgsMessageLog.logMessage(
-            f"dualLoc changed: dest latitude "
-            f"{raw_dest.get('latitude')!r} → {pat_dest.get('latitude')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-    if _norm_val(raw_dest.get("destination")) != _norm_val(pat_dest.get("destination")):
-        QgsMessageLog.logMessage(
-            f"dualLoc changed: destination "
-            f"{raw_dest.get('destination')!r} → {pat_dest.get('destination')!r}",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Destination fields sub-dict
-    if not _fields_equal(raw_dest.get("destination_fields"), pat_dest.get("destination_fields")):
-        QgsMessageLog.logMessage(
-            "dualLoc changed: destination_fields sub-dict differs",
-            "LOC", Qgis.Info,
-        )
-        return False
-
-    # Destination top-level destination_field_N values
-    for k in raw_dest:
-        if k.startswith("destination_field_") and _norm_val(raw_dest[k]) != _norm_val(pat_dest.get(k)):
-            QgsMessageLog.logMessage(
-                f"dualLoc changed: {k} "
-                f"{raw_dest[k]!r} → {pat_dest.get(k)!r}",
-                "LOC", Qgis.Info,
-            )
-            return False
-    return True
-
-
-def _all_stops_unchanged(orig_stops: list, rebuilt_stops: list) -> bool:
-    """Return True if every stop's singleLoc is unchanged."""
-    if len(orig_stops) != len(rebuilt_stops):
-        return False
-    for orig, rebuilt in zip(
-        sorted(orig_stops, key=lambda s: s.get("stopNumber", 0)),
-        rebuilt_stops,
-    ):
-        o_sloc = (orig.get("singleLoc")
-                  or orig.get("singleLOC")
-                  or orig.get("single_loc")
-                  or {})
-        r_sloc = rebuilt.get("singleLoc") or {}
-        if not _sloc_unchanged(o_sloc, r_sloc):
-            return False
-    return True
 
 
 def _rebuild_stops_from_raw(
@@ -1369,6 +1591,12 @@ def _rebuild_stops_from_raw(
             patched_sloc["actual_asset_name"] = actual_name
             patched_sloc["location_id"] = location.location_id
 
+            # If stopNumber changed, bump updatedAt and patch name
+            orig_snum = matched_entry.get("stopNumber", 0)
+            if orig_snum and orig_snum != idx:
+                patched_sloc["updatedAt"] = now
+                patched_sloc["name"] = f"Stop_{idx}_{route.line_name}"
+
             # Normalize to canonical "singleLoc" key for push endpoint.
             # Remove any case-variant keys from the original entry.
             for k in list(orig_entry.keys()):
@@ -1387,9 +1615,12 @@ def _rebuild_stops_from_raw(
                 location.location_id, user_id, now,
                 stop_id_map=stop_id_map,
             )
-            sid = (orig_stop_ids[idx - 1]
-                   if idx - 1 < len(orig_stop_ids)
-                   else str(uuid4()))
+            # Prefer coord-matched stop_id, then positional fallback
+            sid = single_loc.pop("_matched_stop_id", "")
+            if not sid:
+                sid = (orig_stop_ids[idx - 1]
+                       if idx - 1 < len(orig_stop_ids)
+                       else str(uuid4()))
             stops_arr.append({
                 "stop_id": sid or str(uuid4()),
                 "stopNumber": idx,
@@ -1646,6 +1877,20 @@ def _point_wgs84(
 # Generic helpers
 # ------------------------------------------------------------------
 
+# Tracks the layer that the most recently retrieved/registered feature
+# belongs to.  Used by _safe_value to look up stamp-cache entries without
+# needing the layer threaded through every function call.
+# This works because _get_feature / _set_current_layer is always called
+# immediately before _safe_value for the same feature.
+_current_stamp_layer: Optional[QgsVectorLayer] = None
+
+
+def _set_current_layer(layer: QgsVectorLayer) -> None:
+    """Set the active layer for stamp-cache lookups in _safe_value."""
+    global _current_stamp_layer
+    _current_stamp_layer = layer
+
+
 def _get_feature(
     project: QgsProject,
     layer_id: str,
@@ -1658,6 +1903,7 @@ def _get_feature(
     feat = layer.getFeature(feature_id)
     if not feat.isValid():
         return None
+    _set_current_layer(layer)
     return feat
 
 
@@ -1685,6 +1931,7 @@ def _get_tracking_id(
     Pulled features have hidden attributes (``_loc_id``, ``_origin_id``,
     ``_dest_id``) populated with the server's IDs.  If present, we reuse
     them so the push is treated as an update rather than a create.
+    Falls back to the sidecar stamp cache for non-pulled features.
     """
     if feature is not None:
         val = _safe_value(feature, field_name)
@@ -1721,17 +1968,17 @@ def _collect_payload_loc_ids(payload: dict) -> set:
 
 def _parse_stop_loc_ids(
     raw: str,
-) -> Dict[Tuple[float, float], List[Tuple[str, str, float, float]]]:
+) -> Dict[Tuple[float, float], List[tuple]]:
     """Parse a ``_stop_loc_ids`` attribute string into a coord→ID map.
 
-    Format: ``"lon,lat=locid,originid,exactlon,exactlat|..."``
-    Returns ``{(lon, lat): [(loc_id, origin_id, exact_lon, exact_lat), ...]}``.
+    Format: ``"lon,lat=locid,originid,exactlon,exactlat,stopid,createdAt,updatedAt,stopNumber|..."``
+    Returns ``{(lon, lat): [(loc_id, origin_id, exact_lon, exact_lat, stop_id, createdAt, updatedAt, stopNumber), ...]}``.
 
     Multiple entries at the same coordinate (from ingress/egress pairs)
     are stored as a list; callers pop from the front so each stop at
     the same location gets its own unique server ID and exact coords.
     """
-    result: Dict[Tuple[float, float], List[Tuple[str, str, float, float]]] = {}
+    result: Dict[Tuple[float, float], List[tuple]] = {}
     if not raw:
         return result
     for part in raw.split("|"):
@@ -1757,15 +2004,45 @@ def _parse_stop_loc_ids(
                     exact_lat = float(id_parts[3])
             except ValueError:
                 pass
+            # stop_id (5th field, added in v1.4+)
+            stop_id = id_parts[4] if len(id_parts) > 4 else ""
+            # Timestamps (6th/7th fields, added in v1.4+)
+            created_at = id_parts[5] if len(id_parts) > 5 else ""
+            updated_at = id_parts[6] if len(id_parts) > 6 else ""
+            # Original stopNumber (8th field, added in v1.4+)
+            orig_stop_num = 0
+            if len(id_parts) > 7:
+                try:
+                    orig_stop_num = int(id_parts[7])
+                except (ValueError, TypeError):
+                    pass
             key = (round(lon, 8), round(lat, 8))
             result.setdefault(key, []).append(
-                (loc_id, origin_id, exact_lon, exact_lat)
+                (loc_id, origin_id, exact_lon, exact_lat,
+                 stop_id, created_at, updated_at, orig_stop_num)
             )
     return result
 
 
 def _safe_value(feature: QgsFeature, field_name: str) -> str:
-    """Read a feature attribute, returning '' for NULL/missing values."""
+    """Read a feature attribute, returning '' for NULL/missing values.
+
+    For ``_`` prefixed tracking fields, the sidecar stamp cache is checked
+    FIRST (it always has full-length UUIDs), then falls back to the feature
+    attribute.  This avoids using truncated values from Shapefile layers
+    where the old field-based approach may have written partial UUIDs.
+    """
+    is_tracking = field_name.startswith("_")
+
+    # For tracking fields, prefer the stamp cache (always correct).
+    # Uses _current_stamp_layer (set by _get_feature / _set_current_layer)
+    # + feature.id() to construct the cache key.
+    if is_tracking and _current_stamp_layer is not None:
+        cached = _get_stamp_value(
+            _current_stamp_layer, feature.id(), field_name)
+        if cached:
+            return cached
+    # Feature attribute (works for pulled memory layers + regular fields)
     try:
         val = feature.attribute(field_name)
     except Exception:
@@ -1775,6 +2052,11 @@ def _safe_value(feature: QgsFeature, field_name: str) -> str:
     text = str(val)
     if text == "NULL":
         return ""
+    # Guard against truncated UUIDs left by old field-based stamping on
+    # Shapefiles.  UUID fields end in "_id"; valid UUIDs are 36 chars.
+    if is_tracking and field_name.endswith("_id") and text:
+        if len(text) != 36:
+            return ""
     return text
 
 

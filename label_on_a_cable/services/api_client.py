@@ -21,7 +21,7 @@ from .exceptions import (
 
 BASE_URL = "https://api.loc.store/api"
 DEFAULT_TIMEOUT = 30  # seconds
-PUSH_TIMEOUT = 600    # seconds (10 min)
+PUSH_TIMEOUT = 180    # seconds (server statement_timeout = 120s)
 
 _log = logging.getLogger("LOC.api_client")
 

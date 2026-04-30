@@ -11,7 +11,7 @@ from ..models.location import Location
 from ..models.mapping import LayerMapping
 from ..models.route import Route
 from ..services.api_client import ApiClient
-from ..services.exceptions import LOCAPIException
+from ..services.exceptions import AuthenticationException, LOCAPIException
 
 
 class FetchLocationsTask(QgsTask):
@@ -22,11 +22,16 @@ class FetchLocationsTask(QgsTask):
         self.api = api_client
         self.locations: List[Location] = []
         self.error: Optional[str] = None
+        self.auth_failed: bool = False
 
     def run(self):
         try:
             data = self.api.get_all_locations()
             self.locations = Location.list_from_api(data)
+        except AuthenticationException as exc:
+            self.error = str(exc)
+            self.auth_failed = True
+            return False
         except LOCAPIException as exc:
             self.error = str(exc)
             return False
@@ -86,7 +91,10 @@ class PushPreviewTask(QgsTask):
 
     def run(self):
         try:
-            data = self.api.push_locs(self.payload, preview=True)
+            # Strip internal sync metadata before sending to server
+            send_payload = {k: v for k, v in self.payload.items()
+                           if not k.startswith("_")}
+            data = self.api.push_locs(send_payload, preview=True)
             QgsMessageLog.logMessage(
                 f"Preview raw response: {data}", "LOC", Qgis.Warning,
             )
@@ -125,7 +133,10 @@ class PushTask(QgsTask):
 
     def run(self):
         try:
-            data = self.api.push_locs(self.payload, preview=False)
+            # Strip internal sync metadata before sending to server
+            send_payload = {k: v for k, v in self.payload.items()
+                           if not k.startswith("_")}
+            data = self.api.push_locs(send_payload, preview=False)
             if isinstance(data, dict):
                 self.message = data.get("message", "Push complete.")
             else:

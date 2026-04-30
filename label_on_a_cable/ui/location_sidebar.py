@@ -29,6 +29,7 @@ class LocationSidebar(QDockWidget):
     """Dock widget for selecting a LOC Location."""
 
     location_selected = pyqtSignal(object)  # emits a Location
+    auth_failed = pyqtSignal()  # emitted when token is rejected (401/403)
 
     def __init__(self, api_client: ApiClient, parent=None):
         super().__init__("LOC Workspace", parent)
@@ -124,6 +125,13 @@ class LocationSidebar(QDockWidget):
         self._btn_refresh.setEnabled(True)
 
         if task.error:
+            if task.auth_failed:
+                self._status.setText(
+                    "Session expired — please sign in again.")
+                self._status.setStyleSheet("color: red;")
+                self._status.setVisible(True)
+                self.auth_failed.emit()
+                return
             self._status.setText(task.error)
             self._status.setStyleSheet("color: red;")
             self._status.setVisible(True)
