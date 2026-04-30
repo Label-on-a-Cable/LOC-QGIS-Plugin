@@ -21,9 +21,11 @@ class UserDetailsDialog(QDialog):
     """Modal dialog showing the current user's profile.
 
     Emits ``signed_out`` when the user clicks Sign Out.
+    Emits ``sync_requested`` when the user clicks Sync with LOC.
     """
 
     signed_out = pyqtSignal()
+    sync_requested = pyqtSignal()
 
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
@@ -44,6 +46,17 @@ class UserDetailsDialog(QDialog):
 
         layout.addSpacing(12)
 
+        # -- Sync button --
+        btn_sync = QPushButton("Sync with LOC")
+        btn_sync.setToolTip(
+            "Match existing QGIS features to server LOC records by their "
+            "unique asset ID, so future pushes update instead of re-creating."
+        )
+        btn_sync.clicked.connect(self._on_sync)
+        layout.addWidget(btn_sync)
+
+        layout.addSpacing(8)
+
         # -- Buttons --
         btn_row = QHBoxLayout()
 
@@ -61,6 +74,10 @@ class UserDetailsDialog(QDialog):
 
     def _open_dashboard(self):
         webbrowser.open(DASHBOARD_URL)
+
+    def _on_sync(self):
+        self.sync_requested.emit()
+        self.accept()
 
     def _on_sign_out(self):
         self.signed_out.emit()

@@ -203,6 +203,7 @@ class LabelOnACablePlugin:
                 self.auth.current_user, parent=self.iface.mainWindow()
             )
             dlg.signed_out.connect(self._on_sign_out)
+            dlg.sync_requested.connect(self._on_sync_stamps)
             dlg.exec_()
             return
 
@@ -796,4 +797,67 @@ class LabelOnACablePlugin:
             self.PLUGIN_NAME,
             f"Imported {n_locs} LOC(s) into {n_layers} layer(s) "
             f"— {n_routes} route(s) ready for review.",
+        )
+
+    # ------------------------------------------------------------------
+    # Stamp sync — match existing QGIS features to server LOC records
+    # ------------------------------------------------------------------
+
+    def _on_sync_stamps(self):
+        """Fetch server LOC data and match to existing QGIS features."""
+        if not self.active_location:
+            self.iface.messageBar().pushWarning(
+                self.PLUGIN_NAME,
+                "Select a Location in the Workspace sidebar first.",
+            )
+            return
+
+        if not self.layer_mappings:
+            self.iface.messageBar().pushWarning(
+                self.PLUGIN_NAME,
+                "Set up category mappings first (Map Categories button).",
+            )
+            return
+
+        from qgis.core import QgsApplication
+        from .core.tasks import FetchLocsTask
+
+        self._sync_task = FetchLocsTask(
+            self.api, self.active_location.location_id,
+        )
+        self._sync_task.taskCompleted.connect(self._on_sync_fetched)
+        self._sync_task.taskTerminated.connect(self._on_sync_failed)
+        QgsApplication.taskManager().addTask(self._sync_task)
+        self.iface.messageBar().pushInfo(
+            self.PLUGIN_NAME, "Syncing with LOC server...",
+        )
+
+    def _on_sync_fetched(self):
+        """Handle completed sync fetch — match features to server data."""
+        task = self._sync_task
+        if task.locs_data is None:
+            self.iface.messageBar().pushWarning(
+                self.PLUGIN_NAME, "Sync failed: no data returned from server.",
+            )
+            return
+
+        from .core.export_builder import sync_stamps_from_server
+
+        matched, total = sync_stamps_from_server(
+            task.locs_data,
+            self.active_location.location_id,
+            self.layer_mappings,
+        )
+        self.iface.messageBar().pushSuccess(
+            self.PLUGIN_NAME,
+            f"Sync complete: matched {matched} feature(s) "
+            f"to {total} server LOC(s).",
+        )
+
+    def _on_sync_failed(self):
+        """Handle failed sync fetch."""
+        task = self._sync_task
+        msg = task.error or "Unknown error"
+        self.iface.messageBar().pushCritical(
+            self.PLUGIN_NAME, f"Sync failed: {msg}",
         )

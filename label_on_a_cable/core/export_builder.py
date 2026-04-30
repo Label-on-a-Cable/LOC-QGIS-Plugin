@@ -66,7 +66,7 @@ _DUAL_DEST_KNOWN = {"destination"}
 def _fields_fingerprint(*values) -> str:
     """Compute a short hash of field values for change detection."""
     raw = _json.dumps(values, sort_keys=True, default=str)
-    return _hashlib.md5(raw.encode()).hexdigest()
+    return _hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
 
 
 # ------------------------------------------------------------------
@@ -440,6 +440,184 @@ def stamp_ids_after_push(payload: dict) -> int:
         "LOC Export", Qgis.Info,
     )
     return stamped
+
+
+def sync_stamps_from_server(
+    locs_data: dict,
+    location_id: str,
+    layer_mappings: List[LayerMapping],
+) -> Tuple[int, int]:
+    """Match server LOC data to existing QGIS features and write stamp cache.
+
+    Fetches ``unique_asset_id`` from each QGIS feature (via its layer mapping)
+    and matches it against server LOC records.  Matched features get stamp
+    cache entries populated with the server's IDs and timestamps, so
+    subsequent pushes treat them as updates rather than creates.
+
+    Returns ``(matched, total_server)`` — number of features successfully
+    matched and total server LOC count.
+    """
+    project = QgsProject.instance()
+
+    global _active_location_id
+    _active_location_id = location_id
+
+    cache = _load_stamp_cache()
+    loc_stamps = cache.setdefault(location_id, {})
+
+    # ------------------------------------------------------------------
+    # 1. Index ALL server LOCs by unique_asset_id
+    # ------------------------------------------------------------------
+    # server_index: { unique_asset_id: { ...entry data... } }
+    server_index: Dict[str, dict] = {}
+    total_server = 0
+
+    # singleLOCs
+    for sloc in locs_data.get("singleLOCs", []):
+        uid = sloc.get("unique_asset_id", "")
+        if uid:
+            server_index[uid] = {
+                "_loc_id": sloc.get("loc_id", ""),
+                "_origin_id": sloc.get("origin_id", ""),
+                "_createdAt": sloc.get("createdAt", ""),
+                "_updatedAt": sloc.get("updatedAt", ""),
+                "_wrapper_id": sloc.get("id", str(uuid4())),
+                "_type": "single",
+            }
+            total_server += 1
+
+    # dualLOCs (standalone)
+    for dloc in locs_data.get("dualLOCs", []):
+        uid = dloc.get("unique_asset_id", "")
+        dest = dloc.get("LOCDestination") or {}
+        if uid:
+            server_index[uid] = {
+                "_loc_id": dloc.get("loc_id", ""),
+                "_origin_id": dloc.get("origin_id", ""),
+                "_dest_id": dest.get("destination_id", ""),
+                "_createdAt": dloc.get("createdAt", ""),
+                "_updatedAt": dloc.get("updatedAt", ""),
+                "_dest_createdAt": dest.get("createdAt", ""),
+                "_dest_updatedAt": dest.get("updatedAt", ""),
+                "_type": "dual",
+            }
+            total_server += 1
+
+    # multiLoc entries
+    for mloc in locs_data.get("multiLoc", []):
+        multi_id = mloc.get("id", mloc.get("_id", ""))
+        dual_loc = (mloc.get("dualLoc") or mloc.get("dualLOC")
+                    or mloc.get("dual_loc") or {})
+        stops = mloc.get("Stops", mloc.get("stops", []))
+        uid = dual_loc.get("unique_asset_id", "")
+        dest = dual_loc.get("LOCDestination") or {}
+        if uid:
+            entry: Dict[str, str] = {
+                "_loc_id": dual_loc.get("loc_id", ""),
+                "_origin_id": dual_loc.get("origin_id", ""),
+                "_dest_id": dest.get("destination_id", ""),
+                "_multi_id": multi_id,
+                "_route_name": mloc.get("multiName", uid),
+                "_createdAt": dual_loc.get("createdAt", ""),
+                "_updatedAt": dual_loc.get("updatedAt", ""),
+                "_dest_createdAt": dest.get("createdAt", ""),
+                "_dest_updatedAt": dest.get("updatedAt", ""),
+                "_type": "multi",
+            }
+            # Cache stop IDs
+            sorted_stops = sorted(stops, key=lambda s: s.get("stopNumber", 0))
+            entry["_stop_ids"] = ",".join(
+                s.get("stop_id", "") for s in sorted_stops
+            )
+            stop_loc_parts = []
+            for s in sorted_stops:
+                sl = (s.get("singleLoc") or s.get("singleLOC")
+                      or s.get("single_loc") or {})
+                slid = sl.get("loc_id", "")
+                sloid = sl.get("origin_id", "")
+                slon = sl.get("origin_longitude", "")
+                slat = sl.get("origin_latitude", "")
+                sid = s.get("stop_id", "")
+                sl_ca = sl.get("createdAt", "")
+                sl_ua = sl.get("updatedAt", "")
+                snum = s.get("stopNumber", "")
+                if slid and slon and slat:
+                    try:
+                        key = f"{round(float(slon), 8)},{round(float(slat), 8)}"
+                    except (ValueError, TypeError):
+                        continue
+                    stop_loc_parts.append(
+                        f"{key}={slid},{sloid},{slon},{slat},{sid},{sl_ca},{sl_ua},{snum}"
+                    )
+            if stop_loc_parts:
+                entry["_stop_loc_ids"] = "|".join(stop_loc_parts)
+
+            server_index[uid] = entry
+            total_server += 1
+
+    if not server_index:
+        QgsMessageLog.logMessage(
+            "Sync: no server LOCs found to match", "LOC Export", Qgis.Warning,
+        )
+        return 0, 0
+
+    # ------------------------------------------------------------------
+    # 2. Walk QGIS features and match by unique_asset_id
+    # ------------------------------------------------------------------
+    matched = 0
+    mapping_by_layer = {lm.layer_id: lm for lm in layer_mappings}
+
+    for lm in layer_mappings:
+        if not lm.category_id:
+            continue
+        layer = project.mapLayer(lm.layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+
+        geom_type = layer.geometryType()
+        is_line = geom_type == QgsWkbTypes.LineGeometry
+
+        # Determine the QGIS field that holds the matching key
+        if is_line:
+            uid_qfield = lm.qgis_field_for("Route ID")
+        else:
+            uid_qfield = lm.qgis_field_for("Unique Asset Identifier")
+
+        if not uid_qfield:
+            # Try the other key as fallback
+            uid_qfield = (lm.qgis_field_for("Unique Asset Identifier")
+                          or lm.qgis_field_for("Route ID"))
+        if not uid_qfield:
+            continue
+
+        for feat in layer.getFeatures():
+            if not feat.isValid():
+                continue
+            try:
+                feat_uid = feat.attribute(uid_qfield)
+            except Exception:
+                continue
+            if not feat_uid or str(feat_uid) == "NULL":
+                continue
+            feat_uid = str(feat_uid).strip()
+
+            server_entry = server_index.get(feat_uid)
+            if server_entry is None:
+                continue
+
+            cache_key = _stamp_cache_key(layer, feat.id())
+            # Build stamp entry (exclude internal _type marker)
+            stamp = {k: v for k, v in server_entry.items() if k != "_type"}
+            loc_stamps[cache_key] = stamp
+            matched += 1
+
+    _save_stamp_cache(cache)
+
+    QgsMessageLog.logMessage(
+        f"Sync: matched {matched} feature(s) to {total_server} server LOC(s)",
+        "LOC Export", Qgis.Info,
+    )
+    return matched, total_server
 
 
 # ---------------------------------------------------------------------------
