@@ -65,9 +65,10 @@ class FetchCategoriesTask(QgsTask):
 
         # Download category icons (best-effort, skip failures silently)
         for cat in self.categories:
-            if cat.image and cat.image.startswith(("http://", "https://")):
+            img = cat.image if isinstance(cat.image, str) else ""
+            if img and img.startswith(("http://", "https://")):
                 try:
-                    resp = _requests.get(cat.image, timeout=5)
+                    resp = _requests.get(img, timeout=5)
                     resp.raise_for_status()
                     self.icon_data[cat.category_id] = resp.content
                 except Exception:

@@ -31,6 +31,15 @@ class CategoryField:
         return cls()
 
 
+def _parse_image(raw) -> str:
+    """Extract image URL from string or dict (API may return either)."""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        return raw.get("url", raw.get("src", ""))
+    return ""
+
+
 @dataclass
 class Category:
     category_id: str = ""
@@ -50,7 +59,7 @@ class Category:
             loc_type=data.get("LOC_type", data.get("loc_type", "")),
             fields=[CategoryField.from_api(f) for f in raw_fields],
             destination_fields=[CategoryField.from_api(f) for f in raw_dest],
-            image=data.get("image", ""),
+            image=_parse_image(data.get("image", "")),
         )
 
     @classmethod

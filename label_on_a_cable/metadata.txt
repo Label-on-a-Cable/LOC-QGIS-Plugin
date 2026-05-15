@@ -1,6 +1,7 @@
 [general]
 name=Label on a Cable - KelTech IoE
 qgisMinimumVersion=3.22
+qgisMaximumVersion=4.99
 description=LOC QGIS plugin for automated generation, synchronisation, and management of infrastructure labels.
 version=1.4.1
 author=Brandon Kellett, KelTech IoE

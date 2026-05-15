@@ -204,14 +204,14 @@ class LabelOnACablePlugin:
             )
             dlg.signed_out.connect(self._on_sign_out)
             dlg.sync_requested.connect(self._on_sync_stamps)
-            dlg.exec_()
+            dlg.exec()
             return
 
         from .ui.login_dialog import LoginDialog
 
         dlg = LoginDialog(self.auth, parent=self.iface.mainWindow())
         dlg.login_successful.connect(self._on_login_success)
-        dlg.exec_()
+        dlg.exec()
 
     def _on_login_success(self):
         """Called after a successful login."""
@@ -323,7 +323,7 @@ class LabelOnACablePlugin:
             parent=self.iface.mainWindow(),
         )
         dlg.mapping_accepted.connect(self._on_mapping_accepted)
-        dlg.exec_()
+        dlg.exec()
 
         # Cache categories fetched by the dialog (needed for export payload)
         if dlg._categories:
@@ -646,7 +646,7 @@ class LabelOnACablePlugin:
             parent=self.iface.mainWindow(),
         )
         dlg.push_confirmed.connect(self._execute_push)
-        dlg.exec_()
+        dlg.exec()
 
     def _execute_push(self, payload):
         """Execute the real push after user confirms in the preview."""
@@ -760,7 +760,7 @@ class LabelOnACablePlugin:
             parent=self.iface.mainWindow(),
         )
         dlg.import_complete.connect(self._on_pull_complete)
-        dlg.exec_()
+        dlg.exec()
 
         # Cache categories fetched by the dialog
         if dlg._categories:

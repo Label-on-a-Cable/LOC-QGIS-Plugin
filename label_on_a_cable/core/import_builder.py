@@ -26,7 +26,12 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
-from qgis.PyQt.QtCore import QVariant
+try:
+    from qgis.PyQt.QtCore import QVariant
+    _STRING_TYPE = QVariant.String
+except (ImportError, AttributeError):
+    from qgis.PyQt.QtCore import QMetaType
+    _STRING_TYPE = QMetaType.Type.QString
 
 from ..models.category import Category, CategoryField
 from ..models.mapping import FieldMapping, LayerMapping
@@ -1029,7 +1034,7 @@ def _make_qgs_fields(field_names: List[str]) -> QgsFields:
     """Create QgsFields from a list of string field names."""
     qfields = QgsFields()
     for name in field_names:
-        qfields.append(QgsField(name, QVariant.String))
+        qfields.append(QgsField(name, _STRING_TYPE))
     return qfields
 
 
@@ -1050,7 +1055,7 @@ def _create_memory_layer(
     layer = QgsVectorLayer(uri, name, "memory")
 
     dp = layer.dataProvider()
-    dp.addAttributes([QgsField(fn, QVariant.String) for fn in field_names])
+    dp.addAttributes([QgsField(fn, _STRING_TYPE) for fn in field_names])
     layer.updateFields()
 
     # Rebuild each feature with the provider's own field schema
