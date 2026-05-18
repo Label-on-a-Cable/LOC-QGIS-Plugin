@@ -33,6 +33,12 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import QgsProject, QgsVectorLayer
 from qgis.gui import QgsHighlight, QgsMapCanvas
 
+from ..qt_compat import (
+    NON_MODAL, VERTICAL, ALIGN_CENTER,
+    HV_STRETCH, HV_RESIZE_TO_CONTENTS, HV_FIXED,
+    AIV_SELECT_ROWS, AIV_SINGLE_SELECTION, AIV_NO_EDIT_TRIGGERS,
+    FRAME_STYLED_PANEL, FRAME_NO_FRAME,
+)
 from ..models.route import Route, Stop, StopType
 
 
@@ -88,7 +94,7 @@ class RouteReviewDialog(QDialog):
         self.resize(860, 600)
 
         # Allow interaction with the map while dialog is open
-        self.setWindowModality(Qt.NonModal)
+        self.setWindowModality(NON_MODAL)
 
         self._routes = routes
         self._canvas = canvas
@@ -114,7 +120,7 @@ class RouteReviewDialog(QDialog):
 
         # --- Change Summary Banner ---
         self._summary_frame = QFrame()
-        self._summary_frame.setFrameShape(QFrame.StyledPanel)
+        self._summary_frame.setFrameShape(FRAME_STYLED_PANEL)
         self._summary_frame.setStyleSheet(
             "QFrame { background: #f0f4f8; border: 1px solid #d0d7de; "
             "border-radius: 6px; padding: 10px; }"
@@ -144,7 +150,7 @@ class RouteReviewDialog(QDialog):
         root.addWidget(self._summary_frame)
 
         # --- Splitter: routes on top, stops on bottom ---
-        splitter = QSplitter(Qt.Vertical)
+        splitter = QSplitter(VERTICAL)
 
         # --- Routes section ---
         routes_widget = QWidget()
@@ -160,21 +166,21 @@ class RouteReviewDialog(QDialog):
 
         self._route_table = QTableWidget(0, len(_R_HEADERS))
         self._route_table.setHorizontalHeaderLabels(_R_HEADERS)
-        self._route_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._route_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._route_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._route_table.setSelectionBehavior(AIV_SELECT_ROWS)
+        self._route_table.setSelectionMode(AIV_SINGLE_SELECTION)
+        self._route_table.setEditTriggers(AIV_NO_EDIT_TRIGGERS)
         self._route_table.horizontalHeader().setStretchLastSection(False)
         self._route_table.horizontalHeader().setSectionResizeMode(
-            _R_COL_NAME, QHeaderView.Stretch,
+            _R_COL_NAME, HV_STRETCH,
         )
         self._route_table.horizontalHeader().setSectionResizeMode(
-            _R_COL_CAT, QHeaderView.ResizeToContents,
+            _R_COL_CAT, HV_RESIZE_TO_CONTENTS,
         )
         self._route_table.horizontalHeader().setSectionResizeMode(
-            _R_COL_STATUS, QHeaderView.ResizeToContents,
+            _R_COL_STATUS, HV_RESIZE_TO_CONTENTS,
         )
         self._route_table.horizontalHeader().setSectionResizeMode(
-            _R_COL_DELTA, QHeaderView.Fixed,
+            _R_COL_DELTA, HV_FIXED,
         )
         self._route_table.setColumnWidth(_R_COL_DELTA, 50)
         self._route_table.verticalHeader().setVisible(False)
@@ -200,7 +206,7 @@ class RouteReviewDialog(QDialog):
 
         # Stop toolbar (above table)
         toolbar = QFrame()
-        toolbar.setFrameShape(QFrame.NoFrame)
+        toolbar.setFrameShape(FRAME_NO_FRAME)
         toolbar.setStyleSheet(
             "QFrame { background: #f6f8fa; border: 1px solid #d0d7de; "
             "border-radius: 4px; padding: 2px; }"
@@ -240,12 +246,12 @@ class RouteReviewDialog(QDialog):
         # Stop table
         self._stop_table = QTableWidget(0, len(_S_HEADERS))
         self._stop_table.setHorizontalHeaderLabels(_S_HEADERS)
-        self._stop_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._stop_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._stop_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._stop_table.setSelectionBehavior(AIV_SELECT_ROWS)
+        self._stop_table.setSelectionMode(AIV_SINGLE_SELECTION)
+        self._stop_table.setEditTriggers(AIV_NO_EDIT_TRIGGERS)
         self._stop_table.horizontalHeader().setStretchLastSection(True)
         self._stop_table.horizontalHeader().setSectionResizeMode(
-            _S_COL_LABEL, QHeaderView.Stretch,
+            _S_COL_LABEL, HV_STRETCH,
         )
         self._stop_table.setColumnWidth(_S_COL_NO, 40)
         self._stop_table.setColumnWidth(_S_COL_REMOVED, 70)
@@ -423,7 +429,7 @@ class RouteReviewDialog(QDialog):
 
             # Stops count (centered)
             stops_item = QTableWidgetItem(str(route.active_stop_count))
-            stops_item.setTextAlignment(Qt.AlignCenter)
+            stops_item.setTextAlignment(ALIGN_CENTER)
             self._route_table.setItem(row, _R_COL_STOPS, stops_item)
 
             # Status (coloured + bold)
@@ -439,7 +445,7 @@ class RouteReviewDialog(QDialog):
             # Delta column
             delta = self._route_delta(route)
             delta_item = QTableWidgetItem(delta)
-            delta_item.setTextAlignment(Qt.AlignCenter)
+            delta_item.setTextAlignment(ALIGN_CENTER)
             if delta:
                 delta_item.setForeground(QColor(192, 57, 43))
             self._route_table.setItem(row, _R_COL_DELTA, delta_item)
@@ -510,7 +516,7 @@ class RouteReviewDialog(QDialog):
             # No. column -- blank for origin/destination
             no_text = str(stop.stop_number) if stop.stop_number > 0 else ""
             no_item = QTableWidgetItem(no_text)
-            no_item.setTextAlignment(Qt.AlignCenter)
+            no_item.setTextAlignment(ALIGN_CENTER)
             if fg:
                 no_item.setForeground(fg)
             if bg:
@@ -549,7 +555,7 @@ class RouteReviewDialog(QDialog):
             if not stop.is_endpoint:
                 container = QWidget()
                 cb_layout = QHBoxLayout(container)
-                cb_layout.setAlignment(Qt.AlignCenter)
+                cb_layout.setAlignment(ALIGN_CENTER)
                 cb_layout.setContentsMargins(0, 0, 0, 0)
                 cb = QCheckBox()
                 cb.setChecked(stop.removed)
@@ -791,7 +797,7 @@ class RouteReviewDialog(QDialog):
 
             # Stops count
             stops_item = QTableWidgetItem(str(route.active_stop_count))
-            stops_item.setTextAlignment(Qt.AlignCenter)
+            stops_item.setTextAlignment(ALIGN_CENTER)
             self._route_table.setItem(r, _R_COL_STOPS, stops_item)
 
             # Status
@@ -807,7 +813,7 @@ class RouteReviewDialog(QDialog):
             # Delta
             delta = self._route_delta(route)
             delta_item = QTableWidgetItem(delta)
-            delta_item.setTextAlignment(Qt.AlignCenter)
+            delta_item.setTextAlignment(ALIGN_CENTER)
             if delta:
                 delta_item.setForeground(QColor(192, 57, 43))
             self._route_table.setItem(r, _R_COL_DELTA, delta_item)

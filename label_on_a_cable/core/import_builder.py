@@ -33,6 +33,7 @@ except (ImportError, AttributeError):
     from qgis.PyQt.QtCore import QMetaType
     _STRING_TYPE = QMetaType.Type.QString
 
+from ..qt_compat import GEOM_POINT, GEOM_LINE
 from ..models.category import Category, CategoryField
 from ..models.mapping import FieldMapping, LayerMapping
 from ..models.route import Route, Stop, StopType
@@ -421,9 +422,9 @@ def reconstruct_routes(
         layer = project.mapLayer(lm.layer_id)
         if not isinstance(layer, QgsVectorLayer):
             continue
-        if layer.geometryType() == QgsWkbTypes.LineGeometry:
+        if layer.geometryType() == GEOM_LINE:
             line_mappings.append(lm)
-        elif layer.geometryType() == QgsWkbTypes.PointGeometry:
+        elif layer.geometryType() == GEOM_POINT:
             point_mappings.append(lm)
 
     if not line_mappings:

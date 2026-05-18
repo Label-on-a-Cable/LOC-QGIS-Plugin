@@ -10,6 +10,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 
+from .qt_compat import MB_YES, MB_NO, RIGHT_DOCK
 from .services.api_client import ApiClient
 from .services.auth_service import AuthService
 
@@ -273,7 +274,7 @@ class LabelOnACablePlugin:
                 self._on_location_selected
             )
             self._sidebar.auth_failed.connect(self._on_auth_expired)
-            self.iface.addDockWidget(Qt.RightDockWidgetArea, self._sidebar)
+            self.iface.addDockWidget(RIGHT_DOCK, self._sidebar)
             self._sidebar.fetch_locations()
         else:
             self._sidebar.setVisible(not self._sidebar.isVisible())
@@ -375,10 +376,10 @@ class LabelOnACablePlugin:
                 self.iface.mainWindow(),
                 "Regenerate Routes",
                 "You have manual edits that will be discarded. Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                MB_YES | MB_NO,
+                MB_NO,
             )
-            if reply != QMessageBox.Yes:
+            if reply != MB_YES:
                 return
 
         # Pulled data → use vertex-based reconstruction instead of the
@@ -532,10 +533,10 @@ class LabelOnACablePlugin:
                 "should generate routes first — otherwise route data "
                 "will not be included in the push.\n\n"
                 "Continue pushing standalone point assets only?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                MB_YES | MB_NO,
+                MB_NO,
             )
-            if reply != QMessageBox.Yes:
+            if reply != MB_YES:
                 return
 
         if not self.auth.current_user:
@@ -577,10 +578,10 @@ class LabelOnACablePlugin:
                 "previously pushed for these layers will be DELETED "
                 "from the server.\n\n"
                 "Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                MB_YES | MB_NO,
+                MB_NO,
             )
-            if reply != QMessageBox.Yes:
+            if reply != MB_YES:
                 return
 
         # --- Instrumentation: log metrics before push ---
@@ -631,10 +632,10 @@ class LabelOnACablePlugin:
                 "Potential issues detected:\n\n"
                 + "\n".join(f"• {w}" for w in warnings)
                 + "\n\nContinue to preview?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                MB_YES | MB_NO,
+                MB_NO,
             )
-            if reply != QMessageBox.Yes:
+            if reply != MB_YES:
                 return
 
         summary = payload_summary(payload)

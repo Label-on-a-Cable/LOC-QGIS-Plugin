@@ -24,6 +24,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication, QgsVectorLayer
 
+from ..qt_compat import BB_OK, BB_CANCEL
 from ..core.import_builder import (
     build_layers, extract_multi_stop_counts, import_summary,
 )
@@ -87,9 +88,9 @@ class PullDialog(QDialog):
 
         # Buttons
         self._buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            BB_OK | BB_CANCEL
         )
-        self._import_btn = self._buttons.button(QDialogButtonBox.Ok)
+        self._import_btn = self._buttons.button(BB_OK)
         self._import_btn.setText("Import")
         self._import_btn.setEnabled(False)
         self._buttons.accepted.connect(self._on_import)

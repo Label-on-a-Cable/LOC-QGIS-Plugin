@@ -28,6 +28,10 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication, QgsProject, QgsVectorLayer, QgsWkbTypes
 
+from ..qt_compat import (
+    BB_OK, BB_CANCEL, MB_YES, ALIGN_TOP, KEEP_ASPECT_RATIO, SMOOTH_TRANSFORM,
+    GEOM_POINT, GEOM_LINE,
+)
 from ..core.tasks import FetchCategoriesTask
 from ..models.category import Category
 from ..models.mapping import (
@@ -136,15 +140,15 @@ class CategoryMappingDialog(QDialog):
         self._scroll.setWidgetResizable(True)
         self._scroll_content = QWidget()
         self._scroll_layout = QVBoxLayout(self._scroll_content)
-        self._scroll_layout.setAlignment(Qt.AlignTop)
+        self._scroll_layout.setAlignment(ALIGN_TOP)
         self._scroll.setWidget(self._scroll_content)
         root.addWidget(self._scroll)
 
         # OK / Cancel
         self._buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            BB_OK | BB_CANCEL
         )
-        self._buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self._buttons.button(BB_OK).setEnabled(False)
         self._buttons.accepted.connect(self._on_accept)
         self._buttons.rejected.connect(self._on_cancel)
         root.addWidget(self._buttons)
@@ -189,11 +193,11 @@ class CategoryMappingDialog(QDialog):
             pm = QPixmap()
             if pm.loadFromData(data):
                 self._cat_icons[cat_id] = QIcon(
-                    pm.scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    pm.scaled(24, 24, KEEP_ASPECT_RATIO, SMOOTH_TRANSFORM)
                 )
 
         self._status.setVisible(False)
-        self._buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+        self._buttons.button(BB_OK).setEnabled(True)
         self._build_layer_rows()
 
     # ------------------------------------------------------------------
@@ -215,7 +219,7 @@ class CategoryMappingDialog(QDialog):
                 continue
             # Only point and line layers are relevant for LOC export
             if layer.geometryType() not in (
-                QgsWkbTypes.PointGeometry, QgsWkbTypes.LineGeometry,
+                GEOM_POINT, GEOM_LINE,
             ):
                 continue
             row = _LayerRow(layer, self._categories, self._cat_icons,
@@ -300,7 +304,7 @@ class CategoryMappingDialog(QDialog):
         if QMessageBox.question(
             self, "Delete Preset",
             f'Delete preset "{name}"?',
-        ) != QMessageBox.Yes:
+        ) != MB_YES:
             return
         delete_preset(name)
         self._refresh_preset_combo()
@@ -332,15 +336,15 @@ class _LayerRow:
         #   Point layers → single LOC categories only
         #   LineString layers → dual LOC categories only
         geom_type = layer.geometryType()
-        if geom_type == QgsWkbTypes.PointGeometry:
+        if geom_type == GEOM_POINT:
             self._categories = list(self._single_categories)
-        elif geom_type == QgsWkbTypes.LineGeometry:
+        elif geom_type == GEOM_LINE:
             self._categories = [c for c in categories if c.is_dual]
         else:
             self._categories = list(categories)
 
-        self._is_point_layer = (geom_type == QgsWkbTypes.PointGeometry)
-        self._is_line_layer = (geom_type == QgsWkbTypes.LineGeometry)
+        self._is_point_layer = (geom_type == GEOM_POINT)
+        self._is_line_layer = (geom_type == GEOM_LINE)
 
         self.group = QGroupBox(parent=parent)
         layout = QVBoxLayout(self.group)

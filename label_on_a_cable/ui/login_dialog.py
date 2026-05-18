@@ -11,6 +11,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication, QgsTask
 
+from ..qt_compat import BB_OK, BB_CANCEL, TASK_CAN_CANCEL
 from ..services.auth_service import AuthService
 from ..services.exceptions import (
     LOCAPIException,
@@ -22,7 +23,7 @@ class _LoginTask(QgsTask):
     """Runs the blocking login call off the main thread."""
 
     def __init__(self, auth_service, email, password, otp):
-        super().__init__("LOC Login", QgsTask.CanCancel)
+        super().__init__("LOC Login", TASK_CAN_CANCEL)
         self.auth = auth_service
         self.email = email
         self.password = password
@@ -95,9 +96,9 @@ class LoginDialog(QDialog):
         layout.addWidget(self._error_label)
 
         self._buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            BB_OK | BB_CANCEL
         )
-        self._buttons.button(QDialogButtonBox.Ok).setText("Login")
+        self._buttons.button(BB_OK).setText("Login")
         self._buttons.accepted.connect(self._on_submit)
         self._buttons.rejected.connect(self._on_cancel)
         layout.addWidget(self._buttons)
@@ -163,7 +164,7 @@ class LoginDialog(QDialog):
         self._error_label.setVisible(True)
 
     def _set_busy(self, busy: bool):
-        self._buttons.button(QDialogButtonBox.Ok).setEnabled(not busy)
+        self._buttons.button(BB_OK).setEnabled(not busy)
         self._email.setEnabled(not busy)
         self._password.setEnabled(not busy)
         self._otp.setEnabled(not busy)

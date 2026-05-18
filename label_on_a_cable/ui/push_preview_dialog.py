@@ -24,6 +24,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication
 
+from ..qt_compat import BB_OK, BB_CANCEL
 from ..core.tasks import PushPreviewTask
 from ..services.api_client import ApiClient
 
@@ -103,9 +104,9 @@ class PushPreviewDialog(QDialog):
 
         # Buttons
         self._buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            BB_OK | BB_CANCEL
         )
-        self._push_btn = self._buttons.button(QDialogButtonBox.Ok)
+        self._push_btn = self._buttons.button(BB_OK)
         self._push_btn.setText("Push")
         self._push_btn.setEnabled(False)  # enabled after preview loads
         self._buttons.accepted.connect(self._on_push)

@@ -48,6 +48,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
+from ..qt_compat import GEOM_POINT, GEOM_LINE
 from ..models.category import Category, CategoryField
 from ..models.location import Location
 from ..models.mapping import FieldMapping, LayerMapping
@@ -575,7 +576,7 @@ def sync_stamps_from_server(
             continue
 
         geom_type = layer.geometryType()
-        is_line = geom_type == QgsWkbTypes.LineGeometry
+        is_line = geom_type == GEOM_LINE
 
         # Determine the QGIS field that holds the matching key
         if is_line:
@@ -1273,7 +1274,7 @@ def _build_standalone_single_locs(
             continue
 
         # Only point layers
-        if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PointGeometry:
+        if layer.geometryType() != GEOM_POINT:
             continue
 
         cat_fields = cat.fields

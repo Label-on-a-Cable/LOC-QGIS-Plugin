@@ -10,6 +10,7 @@ from ..models.category import Category
 from ..models.location import Location
 from ..models.mapping import LayerMapping
 from ..models.route import Route
+from ..qt_compat import TASK_CAN_CANCEL
 from ..services.api_client import ApiClient
 from ..services.exceptions import AuthenticationException, LOCAPIException
 
@@ -18,7 +19,7 @@ class FetchLocationsTask(QgsTask):
     """Fetch all locations for the current user off the main thread."""
 
     def __init__(self, api_client: ApiClient):
-        super().__init__("Fetching LOC locations", QgsTask.CanCancel)
+        super().__init__("Fetching LOC locations", TASK_CAN_CANCEL)
         self.api = api_client
         self.locations: List[Location] = []
         self.error: Optional[str] = None
@@ -45,7 +46,7 @@ class FetchCategoriesTask(QgsTask):
     """Fetch categories for a location off the main thread."""
 
     def __init__(self, api_client: ApiClient, location_id: str):
-        super().__init__("Fetching LOC categories", QgsTask.CanCancel)
+        super().__init__("Fetching LOC categories", TASK_CAN_CANCEL)
         self.api = api_client
         self.location_id = location_id
         self.categories: List[Category] = []
@@ -80,7 +81,7 @@ class PushPreviewTask(QgsTask):
     """Send payload to LOCs/plugin-v3?stats=true for a dry-run preview."""
 
     def __init__(self, api_client: ApiClient, payload: dict):
-        super().__init__("Fetching push preview", QgsTask.CanCancel)
+        super().__init__("Fetching push preview", TASK_CAN_CANCEL)
         self.api = api_client
         self.payload = payload
         self.stats: Optional[dict] = None
@@ -122,7 +123,7 @@ class PushTask(QgsTask):
     """Execute the real push to LOCs/plugin-v3."""
 
     def __init__(self, api_client: ApiClient, payload: dict):
-        super().__init__("Pushing to LOC", QgsTask.CanCancel)
+        super().__init__("Pushing to LOC", TASK_CAN_CANCEL)
         self.api = api_client
         self.payload = payload
         self.message: str = ""
@@ -158,7 +159,7 @@ class FetchLocsTask(QgsTask):
     """Fetch all LOCs + categories for a location off the main thread."""
 
     def __init__(self, api_client: ApiClient, location_id: str):
-        super().__init__("Fetching LOC data", QgsTask.CanCancel)
+        super().__init__("Fetching LOC data", TASK_CAN_CANCEL)
         self.api = api_client
         self.location_id = location_id
         self.locs_data: Optional[dict] = None
@@ -189,7 +190,7 @@ class GenerateRoutesTask(QgsTask):
 
     def __init__(self, layer_mappings: List[LayerMapping],
                  snap_tolerance: float = 1.0):
-        super().__init__("Generating route labels", QgsTask.CanCancel)
+        super().__init__("Generating route labels", TASK_CAN_CANCEL)
         self.layer_mappings = layer_mappings
         self.snap_tolerance = snap_tolerance
         self.routes: List[Route] = []

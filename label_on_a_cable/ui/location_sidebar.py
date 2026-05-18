@@ -20,6 +20,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication
 
+from ..qt_compat import LEFT_DOCK, RIGHT_DOCK, USER_ROLE, ITEM_IS_SELECTABLE
 from ..core.tasks import FetchLocationsTask
 from ..models.location import Location
 from ..services.api_client import ApiClient
@@ -37,7 +38,7 @@ class LocationSidebar(QDockWidget):
         self._task: Optional[FetchLocationsTask] = None
         self._locations: List[Location] = []
 
-        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.setAllowedAreas(LEFT_DOCK | RIGHT_DOCK)
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -168,12 +169,12 @@ class LocationSidebar(QDockWidget):
             count = len(gid_map[gid_name])
             display = f"{gid_name} ({count} location{'s' if count != 1 else ''})"
             gid_item = QTreeWidgetItem([display])
-            gid_item.setFlags(gid_item.flags() & ~Qt.ItemIsSelectable)
+            gid_item.setFlags(gid_item.flags() & ~ITEM_IS_SELECTABLE)
             self._tree.addTopLevelItem(gid_item)
 
             for loc in sorted(gid_map[gid_name], key=lambda l: l.name):
                 loc_item = QTreeWidgetItem([loc.name])
-                loc_item.setData(0, Qt.UserRole, loc)
+                loc_item.setData(0, USER_ROLE, loc)
                 gid_item.addChild(loc_item)
 
             gid_item.setExpanded(True)
@@ -183,7 +184,7 @@ class LocationSidebar(QDockWidget):
     # ------------------------------------------------------------------
 
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int):
-        loc = item.data(0, Qt.UserRole)
+        loc = item.data(0, USER_ROLE)
         if isinstance(loc, Location):
             self.location_selected.emit(loc)
             self._selection_label.setText(

@@ -3,7 +3,7 @@ name=Label on a Cable - KelTech IoE
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=LOC QGIS plugin for automated generation, synchronisation, and management of infrastructure labels.
-version=1.4.1
+version=1.5.0
 author=Brandon Kellett, KelTech IoE
 email=loc@keltechioe.com
 about=Authenticate to LOC, select a Location, and automatically generate infrastructure labels directly from your QGIS designs — eliminating manual label creation. The plugin enables bidirectional data flow between QGIS and LOC. Pull high-accuracy field data captured by engineers using mobile devices or GNSS receivers to update asset positions in your GIS project. Push bulk attribute updates (such as cable lengths or metadata) from QGIS back into LOC to keep your digital records aligned with real-world installations. Designed to significantly accelerate labelling workflows while improving spatial accuracy and data consistency across design and field operations.
@@ -17,6 +17,13 @@ experimental=False
 deprecated=False
 
 changelog=
+    1.5.0
+    - Full QGIS 4.0 / Qt6 compatibility (backward-compatible with QGIS 3.22+)
+    - Migrated all Qt5 scoped enums to Qt6 via compatibility shim layer
+    - Migrated deprecated QgsWkbTypes geometry enums to Qgis.GeometryType
+    - Migrated QVariant.String to QMetaType for QGIS 4.0 field creation
+    - Migrated API base URL to dashboard.loc.store
+    - Fixed category image parsing for dict-style API responses
     1.4.1
     - Fixed MD5 security flag (usedforsecurity=False for non-cryptographic fingerprint)
     1.4.0

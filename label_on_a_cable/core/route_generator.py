@@ -33,6 +33,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
+from ..qt_compat import GEOM_POINT, GEOM_LINE
 from ..models.mapping import LayerMapping
 from ..models.route import Route, Stop, StopType
 
@@ -150,14 +151,14 @@ def _resolve_configs(
 
         geom_type = layer.geometryType()
 
-        if geom_type == QgsWkbTypes.LineGeometry:
+        if geom_type == GEOM_LINE:
             name_field = (
                 lm.qgis_field_for("Route ID")
                 or lm.first_mapped_qgis_field()
             )
             line_configs.append((layer, name_field, lm))
 
-        elif geom_type == QgsWkbTypes.PointGeometry:
+        elif geom_type == GEOM_POINT:
             # Skip point layers that are stop categories — they contain
             # derived per-route stop singleLOCs, not real structures.
             if lm.category_id in stop_cat_ids:
