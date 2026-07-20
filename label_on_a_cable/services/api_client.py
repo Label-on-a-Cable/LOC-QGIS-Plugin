@@ -19,7 +19,7 @@ from .exceptions import (
     ValidationException,
 )
 
-BASE_URL = "https://dashboard.loc.store/api"
+BASE_URL = "https://dashboard.useloc.com/api/v1"
 DEFAULT_TIMEOUT = 30  # seconds
 PUSH_TIMEOUT = 180    # seconds (server statement_timeout = 120s)
 
@@ -229,8 +229,23 @@ class ApiClient:
 
     # 3. Locations: list all for user
     def get_all_locations(self):
-        """GET locations/all-locations-for-user"""
-        return self._get("locations/all-locations-for-user")
+        """GET locations  (v1)
+
+        v1 returns ``{"locations": [...]}``; the legacy route
+        ``locations/all-locations-for-user`` returned a bare array and no
+        longer exists on v1 (the path is swallowed by ``locations/{id}``
+        and answers "Location not found").  Falls back to the legacy
+        route for older servers and normalizes both shapes to a list.
+        """
+        try:
+            data = self._get("locations")
+        except LOCAPIException as exc:
+            if exc.status_code != 404:
+                raise
+            data = self._get("locations/all-locations-for-user")
+        if isinstance(data, dict):
+            data = data.get("locations", [])
+        return data
 
     # 4. Locations: single location details
     def get_location(self, location_id):

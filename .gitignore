@@ -12,3 +12,6 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Release build artifact
+label_on_a_cable.zip

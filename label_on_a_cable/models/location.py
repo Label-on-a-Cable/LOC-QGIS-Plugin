@@ -49,19 +49,32 @@ class Location:
 
     @classmethod
     def from_api(cls, data: dict) -> "Location":
-        project_data = data.get("Project") or {}
+        project_data = data.get("Project")
+        if project_data is None:
+            # v1 flat shape: project/GID arrive as scalar fields instead
+            # of a nested Project → GlobalIdentifier structure.
+            project_data = {
+                "id": data.get("project_id", ""),
+                "name": data.get("project_name", ""),
+                "GlobalIdentifier": {
+                    "id": data.get("gid", data.get("gid_name", "")),
+                    "name": data.get("gid_name", ""),
+                },
+            }
         return cls(
             location_id=str(data.get("id", data.get("_id", ""))),
             name=data.get("name", ""),
-            longitude=float(data.get("longitude", 0)),
-            latitude=float(data.get("latitude", 0)),
-            radius=float(data.get("radius", 0)),
+            longitude=float(data.get("longitude") or 0),
+            latitude=float(data.get("latitude") or 0),
+            radius=float(data.get("radius") or 0),
             project=Project.from_api(project_data),
         )
 
     @classmethod
     def list_from_api(cls, data) -> "List[Location]":
-        """Parse the array returned by GET all-locations-for-user."""
+        """Parse the location list (v1 dict or legacy bare array)."""
+        if isinstance(data, dict):
+            data = data.get("locations", [])
         if isinstance(data, list):
             return [cls.from_api(item) for item in data]
         return []

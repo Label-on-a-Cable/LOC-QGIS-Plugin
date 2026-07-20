@@ -14,7 +14,7 @@ from qgis.PyQt.QtWidgets import (
 
 from ..models.user import User
 
-DASHBOARD_URL = "https://dashboard.loc.store"
+DASHBOARD_URL = "https://dashboard.useloc.com"
 
 
 class UserDetailsDialog(QDialog):
