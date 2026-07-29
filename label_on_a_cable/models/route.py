@@ -71,6 +71,15 @@ class Route:
     has_edits: bool = False
 
     @property
+    def is_unmatched(self) -> bool:
+        """True when no structures matched this line during generation.
+
+        Unmatched routes push with coordinate-only endpoints taken from
+        the line geometry instead of structure positions.
+        """
+        return not self.stops
+
+    @property
     def active_stops(self) -> List[Stop]:
         """Stops that have not been soft-deleted."""
         return [s for s in self.stops if not s.removed]

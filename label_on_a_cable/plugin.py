@@ -47,9 +47,29 @@ class LabelOnACablePlugin:
         self._gen_task = None         # core.tasks.GenerateRoutesTask
         self._push_task = None        # core.tasks.PushTask
 
+        # Snap tolerance (metres) for route generation, persisted across
+        # QGIS sessions.  _routes_snap_tolerance records the value the
+        # current cached_routes were generated with (None = reconstruction,
+        # which does not snap).
+        self.snap_tolerance = self._load_snap_tolerance()
+        self._routes_snap_tolerance = None
+
         # Pull / import state
         self._pulled_loc_ids = set()  # Set[str] for delete tracking
         self._pulled_multi_stop_counts = {}  # {multi_id: stop_count}
+
+    _SNAP_TOLERANCE_KEY = "LOC/snap_tolerance"
+
+    def _load_snap_tolerance(self) -> float:
+        from qgis.core import QgsSettings
+        from .core.route_generator import DEFAULT_SNAP_TOLERANCE
+        raw = QgsSettings().value(
+            self._SNAP_TOLERANCE_KEY, DEFAULT_SNAP_TOLERANCE,
+        )
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_SNAP_TOLERANCE
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -321,6 +341,7 @@ class LabelOnACablePlugin:
             self.api,
             self.active_location.location_id,
             current_mappings=self.layer_mappings,
+            snap_tolerance=self.snap_tolerance,
             parent=self.iface.mainWindow(),
         )
         dlg.mapping_accepted.connect(self._on_mapping_accepted)
@@ -332,13 +353,22 @@ class LabelOnACablePlugin:
                 c.category_id: c for c in dlg._categories
             }
 
-    def _on_mapping_accepted(self, mappings):
+    def _on_mapping_accepted(self, mappings, snap_tolerance):
         """Called when the user confirms category mappings."""
         self.layer_mappings = mappings
         # Clear pull state — new/changed mappings mean the user is working
         # with different layers (possibly a different project).
         self._pulled_loc_ids = set()
         self._pulled_multi_stop_counts = {}
+
+        if snap_tolerance != self.snap_tolerance:
+            self.snap_tolerance = snap_tolerance
+            # Cached routes were generated with the old tolerance —
+            # invalidate so the next Generate re-runs.
+            self._last_fingerprint = ""
+        from qgis.core import QgsSettings
+        QgsSettings().setValue(self._SNAP_TOLERANCE_KEY, snap_tolerance)
+
         count = len(mappings)
         self.iface.messageBar().pushSuccess(
             self.PLUGIN_NAME,
@@ -401,7 +431,9 @@ class LabelOnACablePlugin:
         from qgis.core import QgsApplication
         from .core.tasks import GenerateRoutesTask
 
-        self._gen_task = GenerateRoutesTask(self.layer_mappings)
+        self._gen_task = GenerateRoutesTask(
+            self.layer_mappings, snap_tolerance=self.snap_tolerance,
+        )
         self._gen_task.taskCompleted.connect(self._on_generation_done)
         self._gen_task.taskTerminated.connect(self._on_generation_done)
         QgsApplication.taskManager().addTask(self._gen_task)
@@ -426,15 +458,21 @@ class LabelOnACablePlugin:
 
         self.cached_routes = task.routes
         self._last_fingerprint = compute_fingerprint(self.layer_mappings)
+        self._routes_snap_tolerance = task.snap_tolerance
         # User explicitly regenerated — pull-time stop counts no longer apply
         self._pulled_multi_stop_counts = {}
 
         count = len(self.cached_routes)
         total_stops = sum(r.active_stop_count for r in self.cached_routes)
-        self.iface.messageBar().pushSuccess(
-            self.PLUGIN_NAME,
-            f"Generated {count} route(s) with {total_stops} stop(s).",
-        )
+        unmatched = sum(1 for r in self.cached_routes if r.is_unmatched)
+        msg = f"Generated {count} route(s) with {total_stops} stop(s)."
+        if unmatched:
+            msg += (
+                f" {unmatched} route(s) matched no structures within "
+                f"{task.snap_tolerance:g} m and will use line-endpoint "
+                f"coordinates."
+            )
+        self.iface.messageBar().pushSuccess(self.PLUGIN_NAME, msg)
         self._show_route_review()
 
     def _run_reconstruction(self):
@@ -446,8 +484,13 @@ class LabelOnACablePlugin:
         from .core.import_builder import reconstruct_routes
         from .core.change_detector import compute_fingerprint
 
-        self.cached_routes = reconstruct_routes(self.layer_mappings)
+        self.cached_routes = reconstruct_routes(
+            self.layer_mappings, snap_tolerance=self.snap_tolerance,
+        )
         self._last_fingerprint = compute_fingerprint(self.layer_mappings)
+        # Reconstruction itself is vertex-based; the tolerance only applies
+        # to its snapping pass for newly added (non-pulled) features.
+        self._routes_snap_tolerance = None
         # User explicitly regenerated — pull-time stop counts no longer apply
         self._pulled_multi_stop_counts = {}
 
@@ -474,6 +517,7 @@ class LabelOnACablePlugin:
         self._review_dlg = RouteReviewDialog(
             self.cached_routes,
             canvas=self.iface.mapCanvas(),
+            snap_tolerance=self._routes_snap_tolerance,
             parent=self.iface.mainWindow(),
         )
         self._review_dlg.finished.connect(self._on_review_closed)
@@ -586,7 +630,7 @@ class LabelOnACablePlugin:
 
         # --- Instrumentation: log metrics before push ---
         metrics = log_payload_metrics(payload)
-        QgsMessageLog.logMessage(metrics, "LOC Push", Qgis.Info)
+        QgsMessageLog.logMessage(metrics, "LOC Push", Qgis.MessageLevel.Info)
 
         # --- Build reference data for invariant checks ---
         # Only use in-memory pull counts (set on pull, cleared on regeneration).
@@ -601,12 +645,12 @@ class LabelOnACablePlugin:
             QgsMessageLog.logMessage(
                 f"Stop count source: in-memory pull data "
                 f"({len(expected_counts)} route(s))",
-                "LOC Push", Qgis.Info,
+                "LOC Push", Qgis.MessageLevel.Info,
             )
         else:
             QgsMessageLog.logMessage(
                 "Stop count source: none (skipping stop-count invariant)",
-                "LOC Push", Qgis.Info,
+                "LOC Push", Qgis.MessageLevel.Info,
             )
 
         # --- Preflight invariant validation ---
@@ -639,6 +683,11 @@ class LabelOnACablePlugin:
                 return
 
         summary = payload_summary(payload)
+        # Routes that matched no structures push with line-endpoint
+        # coordinates — surface this so the operator confirms knowingly.
+        summary["routes_unmatched"] = sum(
+            1 for r in self.cached_routes if r.is_unmatched
+        )
 
         dlg = PushPreviewDialog(
             api_client=self.api,

@@ -85,9 +85,15 @@ def build_payload(
 ) -> dict:
     """Build the complete LOCs/plugin-v3 push payload.
 
-    If *pulled_loc_ids* is provided (non-empty set), delete detection is
-    enabled: any loc_id that was pulled but is no longer present in the
-    payload will be added to a ``deleted_locs`` array.
+    The push endpoint is a full replacement: the server bins every LOC
+    in the location that the payload no longer references.  There is no
+    delete list in the API — leaving an entry out of the payload IS the
+    delete.
+
+    If *pulled_loc_ids* is provided (non-empty set), any pulled loc_id
+    that is no longer present in the payload is listed under the
+    internal ``_deleted_loc_ids`` key (stripped before sending) so the
+    push preview can warn the operator about impending deletions.
     """
     project = QgsProject.instance()
     now = _now_iso()
@@ -120,6 +126,13 @@ def build_payload(
         line_feature = _get_feature(
             project, route.line_layer_id, route.line_feature_id,
         )
+        if line_feature is None:
+            # The source feature no longer exists (deleted after
+            # generation or pull).  Leave the route out: the push is a
+            # full replacement, so absence is what deletes it server-side.
+            # Emitting the stale route would resurrect the deleted asset
+            # under a fresh UUID.
+            continue
         line_cat = categories.get(line_mapping.category_id)
 
         # Use the actual origin/destination POINT feature coordinates,
@@ -274,7 +287,31 @@ def build_payload(
         "_feature_map": _feature_map,
     }
 
+    if pulled_loc_ids:
+        present_ids = _collect_payload_loc_ids(payload)
+        payload["_deleted_loc_ids"] = sorted(pulled_loc_ids - present_ids)
+
     return payload
+
+
+def _collect_payload_loc_ids(payload: dict) -> set:
+    """Return every loc_id referenced by the outgoing payload."""
+    ids: set = set()
+    for sl in payload.get("single_locs", []):
+        if sl.get("loc_id"):
+            ids.add(sl["loc_id"])
+    for dl in payload.get("dual_locs", []):
+        if dl.get("loc_id"):
+            ids.add(dl["loc_id"])
+    for ml in payload.get("multiLocs", []):
+        dl = ml.get("dualLoc", {})
+        if isinstance(dl, dict) and dl.get("loc_id"):
+            ids.add(dl["loc_id"])
+        for stop in ml.get("Stops", []):
+            sl = stop.get("singleLoc", {})
+            if isinstance(sl, dict) and sl.get("loc_id"):
+                ids.add(sl["loc_id"])
+    return ids
 
 
 def payload_summary(payload: dict) -> dict:
@@ -298,6 +335,7 @@ def payload_summary(payload: dict) -> dict:
         "total_stops": total_stops,
         "standalone_assets": len(single),
         "total_locs": total_locs,
+        "will_be_deleted": len(payload.get("_deleted_loc_ids", [])),
     }
 
 
@@ -438,7 +476,7 @@ def stamp_ids_after_push(payload: dict) -> int:
 
     QgsMessageLog.logMessage(
         f"stamp_ids_after_push: cached {stamped} feature(s)",
-        "LOC Export", Qgis.Info,
+        "LOC Export", Qgis.MessageLevel.Info,
     )
     return stamped
 
@@ -558,7 +596,7 @@ def sync_stamps_from_server(
 
     if not server_index:
         QgsMessageLog.logMessage(
-            "Sync: no server LOCs found to match", "LOC Export", Qgis.Warning,
+            "Sync: no server LOCs found to match", "LOC Export", Qgis.MessageLevel.Warning,
         )
         return 0, 0
 
@@ -596,8 +634,8 @@ def sync_stamps_from_server(
                 continue
             try:
                 feat_uid = feat.attribute(uid_qfield)
-            except Exception:
-                continue
+            except (KeyError, RuntimeError):
+                feat_uid = None
             if not feat_uid or str(feat_uid) == "NULL":
                 continue
             feat_uid = str(feat_uid).strip()
@@ -616,7 +654,7 @@ def sync_stamps_from_server(
 
     QgsMessageLog.logMessage(
         f"Sync: matched {matched} feature(s) to {total_server} server LOC(s)",
-        "LOC Export", Qgis.Info,
+        "LOC Export", Qgis.MessageLevel.Info,
     )
     return matched, total_server
 
@@ -713,7 +751,7 @@ def _migrate_stamps_for_routes(
         _save_stamp_cache(cache)
         QgsMessageLog.logMessage(
             f"Migrated {migrated} stamp cache entries to current layers",
-            "LOC Export", Qgis.Info,
+            "LOC Export", Qgis.MessageLevel.Info,
         )
     return migrated
 
@@ -745,7 +783,7 @@ def _save_stamp_cache(cache: Dict[str, dict]) -> None:
         QgsMessageLog.logMessage(
             "Cannot save stamp cache: QGIS project not saved yet. "
             "Save the project first so LOC IDs persist across sessions.",
-            "LOC Export", Qgis.Warning,
+            "LOC Export", Qgis.MessageLevel.Warning,
         )
         return
     try:
@@ -755,7 +793,7 @@ def _save_stamp_cache(cache: Dict[str, dict]) -> None:
     except Exception as exc:
         QgsMessageLog.logMessage(
             f"Failed to save stamp cache: {exc}",
-            "LOC Export", Qgis.Warning,
+            "LOC Export", Qgis.MessageLevel.Warning,
         )
 
 
@@ -947,6 +985,13 @@ def log_payload_metrics(payload: dict) -> str:
         lines.append(f"  Route '{name}': {n_stops} stop(s)")
     lines.append(f"  Total stops: {total_stops}")
 
+    deleted_ids = payload.get("_deleted_loc_ids", [])
+    if deleted_ids:
+        lines.append(
+            f"  Will be deleted on server (absent from payload): "
+            f"{len(deleted_ids)}"
+        )
+
     # Payload size
     payload_bytes = len(_json.dumps(payload, default=str).encode())
     lines.append(f"  Payload size: {payload_bytes / 1024:.1f} KB")
@@ -1029,7 +1074,9 @@ def _build_dual_loc_obj(
     if aan_qfield and line_feature is not None:
         actual_asset_name = _safe_value(line_feature, aan_qfield)
     if not actual_asset_name:
-        actual_asset_name = route.origin
+        # Unmatched routes have no origin structure — fall back to the
+        # line name so the asset is identifiable in LOC.
+        actual_asset_name = route.origin or route.line_name
 
     # Resolve destination from mapped "Destination" field
     dest_qfield = mapping.qgis_field_for("Destination")
@@ -1720,7 +1767,7 @@ def _rebuild_stops_from_raw(
             QgsMessageLog.logMessage(
                 f"Stop {idx} of '{route.line_name}': coord mismatch, "
                 f"using sequential fallback (pt={coord_key})",
-                "LOC", Qgis.Info,
+                "LOC", Qgis.MessageLevel.Info,
             )
 
         if matched_entry is not None:

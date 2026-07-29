@@ -111,21 +111,33 @@ class MappingPreset:
     """A saved collection of layer→category mappings."""
     name: str = ""
     layer_mappings: List[LayerMapping] = field(default_factory=list)
+    # Snap tolerance in metres for route generation.  None = not stored
+    # (pre-1.6.0 preset); callers fall back to the generator default.
+    snap_tolerance: Optional[float] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name,
             "layer_mappings": [lm.to_dict() for lm in self.layer_mappings],
         }
+        if self.snap_tolerance is not None:
+            d["snap_tolerance"] = self.snap_tolerance
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "MappingPreset":
+        raw_tol = d.get("snap_tolerance")
+        try:
+            snap_tolerance = float(raw_tol) if raw_tol is not None else None
+        except (TypeError, ValueError):
+            snap_tolerance = None
         return cls(
             name=d.get("name", ""),
             layer_mappings=[
                 LayerMapping.from_dict(lm)
                 for lm in d.get("layer_mappings", [])
             ],
+            snap_tolerance=snap_tolerance,
         )
 
 

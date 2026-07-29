@@ -106,7 +106,9 @@ def generate_routes(
                 point_configs, snap_tolerance,
                 line_xform, transforms,
             )
-            if route and route.stops:
+            # Routes with no matched structures are kept: they push as
+            # coordinate-only routes (line endpoints), not silently dropped.
+            if route is not None:
                 route.category_name = line_mapping.category_name
                 routes.append(route)
 
@@ -283,16 +285,20 @@ def _build_route_for_feature(
     snap_tolerance: float,
     line_xform: Optional[QgsCoordinateTransform],
     transforms: Dict[str, Optional[QgsCoordinateTransform]],
-) -> Route:
+) -> Optional[Route]:
     """Build a single Route from one line feature.
 
     Geometries are transformed to the project CRS, then an explicit
     vertex-walk computes per-point distances along the line for correct
     sequential ordering.
+
+    Returns None for degenerate geometry (empty, or fewer than two
+    vertices).  A line that matches no structures within tolerance
+    returns a Route with no stops.
     """
     line_geom = line_feature.geometry()
     if line_geom.isEmpty() or line_geom.isNull():
-        return Route()
+        return None
 
     # Transform line geometry to project CRS
     line_geom_proj = QgsGeometry(line_geom)
@@ -302,7 +308,7 @@ def _build_route_for_feature(
     # Extract ordered vertices + pre-compute segment info
     vertices = _extract_vertices(line_geom_proj)
     if len(vertices) < 2:
-        return Route()
+        return None
     seg_cum_start, seg_lengths = _precompute_segments(vertices)
 
     line_name = str(line_feature[line_name_field]) if line_name_field else ""
@@ -338,7 +344,13 @@ def _build_route_for_feature(
             candidates.append((dist_along, struct_name, cfg, pt_feat))
 
     if not candidates:
-        return Route()
+        # No structures within tolerance — keep the route so the cable
+        # still pushes, using its line endpoints as coordinates.
+        return Route(
+            line_name=line_name,
+            line_layer_id=line_layer.id(),
+            line_feature_id=line_feature.id(),
+        )
 
     # Sort by distance along line → sequential stop ordering
     candidates.sort(key=lambda c: c[0])

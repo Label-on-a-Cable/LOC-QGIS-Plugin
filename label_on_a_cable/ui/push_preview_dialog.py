@@ -90,9 +90,32 @@ class PushPreviewDialog(QDialog):
             "Standalone point assets:",
             QLabel(str(summary.get("standalone_assets", 0))),
         )
+        unmatched = summary.get("routes_unmatched", 0)
+        if unmatched:
+            unmatched_label = QLabel(str(unmatched))
+            unmatched_label.setStyleSheet("color: #b35900; font-weight: bold;")
+            unmatched_label.setToolTip(
+                "These cable routes matched no structures within the snap "
+                "tolerance. They will push with coordinates taken from the "
+                "line endpoints instead of structure positions."
+            )
+            local_layout.addRow(
+                "Routes without matched structures:", unmatched_label,
+            )
         # Bold total
         total_label = QLabel(f"<b>{summary.get('total_locs', 0)}</b>")
         local_layout.addRow("Total LOCs:", total_label)
+
+        deleted = summary.get("will_be_deleted", 0)
+        if deleted:
+            del_label = QLabel(str(deleted))
+            del_label.setStyleSheet("color: #c0392b; font-weight: bold;")
+            del_label.setToolTip(
+                "LOCs that were pulled from this location but are no "
+                "longer in the data being pushed. The push is a full "
+                "replacement — the server will delete them."
+            )
+            local_layout.addRow("Will be deleted on server:", del_label)
         root.addWidget(local_group)
 
         # Server preview group

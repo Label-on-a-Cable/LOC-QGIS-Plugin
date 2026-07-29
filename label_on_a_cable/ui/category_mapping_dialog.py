@@ -15,6 +15,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -32,6 +33,7 @@ from ..qt_compat import (
     BB_OK, BB_CANCEL, MB_YES, ALIGN_TOP, KEEP_ASPECT_RATIO, SMOOTH_TRANSFORM,
     GEOM_POINT, GEOM_LINE,
 )
+from ..core.route_generator import DEFAULT_SNAP_TOLERANCE
 from ..core.tasks import FetchCategoriesTask
 from ..models.category import Category
 from ..models.mapping import (
@@ -48,16 +50,18 @@ from ..services.api_client import ApiClient
 class CategoryMappingDialog(QDialog):
     """Modal dialog for layer → category + field mapping.
 
-    Emits ``mapping_accepted`` with the list of LayerMappings on OK.
+    Emits ``mapping_accepted`` with the list of LayerMappings and the
+    snap tolerance (metres) on OK.
     """
 
-    mapping_accepted = pyqtSignal(list)  # List[LayerMapping]
+    mapping_accepted = pyqtSignal(list, float)  # List[LayerMapping], snap m
 
     def __init__(
         self,
         api_client: ApiClient,
         location_id: str,
         current_mappings: Optional[List[LayerMapping]] = None,
+        snap_tolerance: float = DEFAULT_SNAP_TOLERANCE,
         parent=None,
     ):
         super().__init__(parent)
@@ -66,6 +70,7 @@ class CategoryMappingDialog(QDialog):
 
         self.api = api_client
         self.location_id = location_id
+        self._initial_snap_tolerance = snap_tolerance
         self._categories: List[Category] = []
         self._task: Optional[FetchCategoriesTask] = None
 
@@ -129,6 +134,28 @@ class CategoryMappingDialog(QDialog):
         export_bar.addWidget(btn_deselect_all)
         export_bar.addStretch()
         root.addLayout(export_bar)
+
+        # Snap tolerance for route generation
+        snap_bar = QHBoxLayout()
+        snap_bar.addWidget(QLabel("Snap tolerance (m):"))
+        self._snap_spin = QDoubleSpinBox()
+        self._snap_spin.setRange(0.1, 50.0)
+        self._snap_spin.setSingleStep(0.5)
+        self._snap_spin.setDecimals(1)
+        self._snap_spin.setValue(self._initial_snap_tolerance)
+        self._snap_spin.setToolTip(
+            "Maximum distance between a structure and the cable line for "
+            "the structure to become a route stop."
+        )
+        snap_bar.addWidget(self._snap_spin)
+        snap_hint = QLabel(
+            "1.0 for GPS-collected data. 5–10 for CAD imports, where "
+            "symbols are drafted offset from the linework."
+        )
+        snap_hint.setStyleSheet("color: gray; font-size: 11px;")
+        snap_hint.setWordWrap(True)
+        snap_bar.addWidget(snap_hint, 1)
+        root.addLayout(snap_bar)
 
         # Status label
         self._status = QLabel("Loading categories...")
@@ -240,7 +267,7 @@ class CategoryMappingDialog(QDialog):
     def _on_accept(self):
         mappings = [row.to_mapping() for row in self._layer_rows
                     if row.is_mapped()]
-        self.mapping_accepted.emit(mappings)
+        self.mapping_accepted.emit(mappings, self._snap_spin.value())
         self.accept()
 
     # ------------------------------------------------------------------
@@ -261,7 +288,11 @@ class CategoryMappingDialog(QDialog):
             return
         mappings = [row.to_mapping() for row in self._layer_rows
                     if row.is_mapped()]
-        preset = MappingPreset(name=name.strip(), layer_mappings=mappings)
+        preset = MappingPreset(
+            name=name.strip(),
+            layer_mappings=mappings,
+            snap_tolerance=self._snap_spin.value(),
+        )
         save_preset(preset)
         self._refresh_preset_combo()
         self._preset_combo.setCurrentText(name.strip())
@@ -274,6 +305,8 @@ class CategoryMappingDialog(QDialog):
         preset = presets.get(name)
         if not preset:
             return
+        if preset.snap_tolerance is not None:
+            self._snap_spin.setValue(preset.snap_tolerance)
         lookup_by_id = {lm.layer_id: lm for lm in preset.layer_mappings}
         lookup_by_name = {lm.layer_name: lm for lm in preset.layer_mappings}
         for row in self._layer_rows:

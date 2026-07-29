@@ -44,7 +44,7 @@ WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 _TAG = "LOC Import"
 
 
-def _log(msg: str, level=Qgis.Info) -> None:
+def _log(msg: str, level=Qgis.MessageLevel.Info) -> None:
     QgsMessageLog.logMessage(msg, _TAG, level)
 
 # Essential fields that always appear on imported layers
@@ -216,7 +216,7 @@ def build_layers(
 
         if not cat_id:
             _log(f"multiLoc {multi_id}: no category_id on dualLoc, skipping",
-                 Qgis.Warning)
+                 Qgis.MessageLevel.Warning)
             continue
 
         cat = cat_lookup.get(cat_id)
@@ -395,6 +395,7 @@ def reconstruct_routes(
     layer_mappings: List[LayerMapping],
     *,
     skip_snapping: bool = False,
+    snap_tolerance: Optional[float] = None,
 ) -> List[Route]:
     """Reconstruct Route objects from pulled QGIS layers.
 
@@ -657,7 +658,12 @@ def reconstruct_routes(
     #  - Pulled features: merge snap-discovered stops into the
     #    reconstructed route (adds newly placed points, respects deleted
     #    points — reconstruction already omits them from pt_index).
-    snap_routes = _snap_generate_routes(layer_mappings)
+    if snap_tolerance is not None:
+        snap_routes = _snap_generate_routes(
+            layer_mappings, snap_tolerance=snap_tolerance,
+        )
+    else:
+        snap_routes = _snap_generate_routes(layer_mappings)
     snap_by_key: Dict[Tuple[str, int], Route] = {}
     for r in snap_routes:
         snap_by_key[(r.line_layer_id, r.line_feature_id)] = r

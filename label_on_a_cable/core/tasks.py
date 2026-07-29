@@ -10,6 +10,7 @@ from ..models.category import Category
 from ..models.location import Location
 from ..models.mapping import LayerMapping
 from ..models.route import Route
+from .route_generator import DEFAULT_SNAP_TOLERANCE
 from ..qt_compat import TASK_CAN_CANCEL
 from ..services.api_client import ApiClient
 from ..services.exceptions import AuthenticationException, LOCAPIException
@@ -72,8 +73,11 @@ class FetchCategoriesTask(QgsTask):
                     resp = _requests.get(img, timeout=5)
                     resp.raise_for_status()
                     self.icon_data[cat.category_id] = resp.content
-                except Exception:
-                    pass
+                except (_requests.RequestException, OSError) as exc:
+                    QgsMessageLog.logMessage(
+                        f"Icon download failed for {img}: {exc}",
+                        "LOC", Qgis.MessageLevel.Warning,
+                    )
         return True
 
 
@@ -98,14 +102,14 @@ class PushPreviewTask(QgsTask):
                            if not k.startswith("_")}
             data = self.api.push_locs(send_payload, preview=True)
             QgsMessageLog.logMessage(
-                f"Preview raw response: {data}", "LOC", Qgis.Warning,
+                f"Preview raw response: {data}", "LOC", Qgis.MessageLevel.Warning,
             )
             if isinstance(data, dict):
                 self.stats = data.get("stats", data)
             else:
                 self.stats = {}
             QgsMessageLog.logMessage(
-                f"Preview parsed stats: {self.stats}", "LOC", Qgis.Warning,
+                f"Preview parsed stats: {self.stats}", "LOC", Qgis.MessageLevel.Warning,
             )
         except LOCAPIException as exc:
             self.error = str(exc)
@@ -189,7 +193,7 @@ class GenerateRoutesTask(QgsTask):
     """
 
     def __init__(self, layer_mappings: List[LayerMapping],
-                 snap_tolerance: float = 1.0):
+                 snap_tolerance: float = DEFAULT_SNAP_TOLERANCE):
         super().__init__("Generating route labels", TASK_CAN_CANCEL)
         self.layer_mappings = layer_mappings
         self.snap_tolerance = snap_tolerance

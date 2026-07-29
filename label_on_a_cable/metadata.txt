@@ -3,7 +3,7 @@ name=Label on a Cable - KelTech IoE
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=LOC QGIS plugin for automated generation, synchronisation, and management of infrastructure labels.
-version=1.5.1
+version=1.6.0
 author=Brandon Kellett, KelTech IoE
 email=loc@keltechioe.com
 about=Authenticate to LOC, select a Location, and automatically generate infrastructure labels directly from your QGIS designs — eliminating manual label creation. The plugin enables bidirectional data flow between QGIS and LOC. Pull high-accuracy field data captured by engineers using mobile devices or GNSS receivers to update asset positions in your GIS project. Push bulk attribute updates (such as cable lengths or metadata) from QGIS back into LOC to keep your digital records aligned with real-world installations. Designed to significantly accelerate labelling workflows while improving spatial accuracy and data consistency across design and field operations.
@@ -17,6 +17,22 @@ experimental=False
 deprecated=False
 
 changelog=
+    1.6.0
+    - Cable routes that match no structures are now pushed with line-endpoint
+      coordinates instead of being silently dropped; the matched/unmatched
+      split is reported in Route Review and Push Preview
+    - Snap tolerance is now a user setting in the Category Mapping dialog
+      (persisted across sessions and in mapping presets; default 1.0 m,
+      raise to 5-10 m for CAD-derived data)
+    - Route Review header shows the snap tolerance used for generation
+    - Fixed duplicated snap tolerance default: DEFAULT_SNAP_TOLERANCE in
+      route_generator.py is now the single source of truth
+    - Delete detection now works: features deleted in QGIS after a pull are
+      excluded from the push payload so the server removes them (the push
+      endpoint is a full replacement), and Push Preview shows a
+      "Will be deleted on server" count before you confirm
+    - Maintenance: Qt6/QGIS 4 enum cleanup, narrower exception handling,
+      health-check and session housekeeping
     1.5.1
     - Migrated API base URL to dashboard.useloc.com/api/v1 (old domains now redirect, breaking POST requests)
     - Location list now uses the v1 GET /locations endpoint (legacy endpoint removed on new backend)

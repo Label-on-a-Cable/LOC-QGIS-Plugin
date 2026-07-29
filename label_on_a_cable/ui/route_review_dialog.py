@@ -87,7 +87,8 @@ class RouteReviewDialog(QDialog):
     Emits ``push_requested`` when the user clicks Push to LOC.
     """
 
-    def __init__(self, routes: List[Route], canvas: QgsMapCanvas, parent=None):
+    def __init__(self, routes: List[Route], canvas: QgsMapCanvas,
+                 snap_tolerance: Optional[float] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Route Review & Commit")
         self.setMinimumSize(780, 520)
@@ -98,6 +99,7 @@ class RouteReviewDialog(QDialog):
 
         self._routes = routes
         self._canvas = canvas
+        self._snap_tolerance = snap_tolerance
         self._route_highlights: List[QgsHighlight] = []
         self._stop_highlights: List[QgsHighlight] = []
         self._closing = False
@@ -290,12 +292,16 @@ class RouteReviewDialog(QDialog):
         """Recompute and display the change summary banner."""
         total_routes = len(self._routes)
         total_stops = sum(r.active_stop_count for r in self._routes)
+        unmatched = sum(1 for r in self._routes if r.is_unmatched)
 
-        self._summary_counts.setText(
+        counts_text = (
             f"{total_routes} route{'s' if total_routes != 1 else ''}  "
             f"\u00b7  "
             f"{total_stops} intermediate stop{'s' if total_stops != 1 else ''}"
         )
+        if self._snap_tolerance is not None:
+            counts_text += f"  \u00b7  snap {self._snap_tolerance:g} m"
+        self._summary_counts.setText(counts_text)
 
         # Compute per-route change stats
         new_count = 0
@@ -314,6 +320,12 @@ class RouteReviewDialog(QDialog):
         parts.append(f"{new_count} new")
         parts.append(f"{modified_count} modified")
         parts.append(f"{removed_routes_count} with removed stops")
+        if unmatched:
+            parts.append(
+                f"{total_routes - unmatched} of {total_routes} matched "
+                f"structures \u2014 {unmatched} will push with "
+                f"line-endpoint coordinates"
+            )
         self._summary_changes.setText("  \u00b7  ".join(parts))
 
         # Overall state
@@ -417,14 +429,16 @@ class RouteReviewDialog(QDialog):
                 QTableWidgetItem(route.category_name or ""),
             )
 
-            # Origin
+            # Origin / Destination — unmatched routes have no structure
+            # names; they push with raw line-endpoint coordinates.
+            endpoint_placeholder = "(line endpoint)" if route.is_unmatched else ""
             self._route_table.setItem(
-                row, _R_COL_ORIGIN, QTableWidgetItem(route.origin),
+                row, _R_COL_ORIGIN,
+                QTableWidgetItem(route.origin or endpoint_placeholder),
             )
-
-            # Destination
             self._route_table.setItem(
-                row, _R_COL_DEST, QTableWidgetItem(route.destination),
+                row, _R_COL_DEST,
+                QTableWidgetItem(route.destination or endpoint_placeholder),
             )
 
             # Stops count (centered)
@@ -511,7 +525,7 @@ class RouteReviewDialog(QDialog):
                 font.setStrikeOut(True)
 
             # Foreground colour
-            fg = Qt.gray if is_removed else None
+            fg = Qt.GlobalColor.gray if is_removed else None
 
             # No. column -- blank for origin/destination
             no_text = str(stop.stop_number) if stop.stop_number > 0 else ""
