@@ -172,7 +172,7 @@ class LocationSidebar(QDockWidget):
             gid_item.setFlags(gid_item.flags() & ~ITEM_IS_SELECTABLE)
             self._tree.addTopLevelItem(gid_item)
 
-            for loc in sorted(gid_map[gid_name], key=lambda l: l.name):
+            for loc in sorted(gid_map[gid_name], key=lambda item: item.name):
                 loc_item = QTreeWidgetItem([loc.name])
                 loc_item.setData(0, USER_ROLE, loc)
                 gid_item.addChild(loc_item)

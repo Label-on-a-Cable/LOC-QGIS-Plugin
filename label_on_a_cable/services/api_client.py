@@ -80,8 +80,8 @@ class ApiClient:
             body = ""
             try:
                 body = response.text[:5000]
-            except Exception:
-                pass
+            except (UnicodeDecodeError, RuntimeError) as exc:
+                _log.debug("Could not decode error response body: %s", exc)
 
             elapsed = (
                 response.elapsed.total_seconds()
@@ -193,9 +193,9 @@ class ApiClient:
     def health_check(self):
         """Check whether the LOC server is reachable.
 
-        There is no /health endpoint.  Instead we POST to the login
-        endpoint with empty credentials.  The server will reject the
-        request (400/401), but that proves it is up and responding.
+        There is no /health endpoint.  Instead we POST an empty body to
+        the login endpoint.  The server will reject the request
+        (400/401), but that proves it is up and responding.
 
         Returns True  — server is reachable.
         Raises NetworkException — DNS failure / connection refused / timeout.
@@ -203,7 +203,7 @@ class ApiClient:
         try:
             self.session.post(
                 self._url("auth/app/login/enabled2fa"),
-                json={"email": "", "password": ""},
+                json={},
                 params={"plugin": "true"},
                 timeout=DEFAULT_TIMEOUT,
             )

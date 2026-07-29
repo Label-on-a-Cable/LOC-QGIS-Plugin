@@ -9,7 +9,8 @@ from qgis.core import QgsSettings
 from ..models.user import Organization, User
 
 # QSettings key constants — must match the old plugin for compatibility.
-_KEY_TOKEN = "LOC/auth_token"
+# (This is a settings key name, not a credential.)
+_KEY_AUTH = "LOC/auth_token"
 _KEY_USER_ID = "LOC/user_id"
 _KEY_USER_NAME = "LOC/user_name"
 _KEY_USER_EMAIL = "LOC/user_email"
@@ -19,7 +20,7 @@ _KEY_ORG_ID = "LOC/org_id"
 _KEY_2FA = "LOC/enabled_2fa"
 
 _ALL_KEYS = (
-    _KEY_TOKEN, _KEY_USER_ID, _KEY_USER_NAME, _KEY_USER_EMAIL,
+    _KEY_AUTH, _KEY_USER_ID, _KEY_USER_NAME, _KEY_USER_EMAIL,
     _KEY_USER_ROLE, _KEY_ORG_NAME, _KEY_ORG_ID, _KEY_2FA,
 )
 
@@ -27,7 +28,7 @@ _ALL_KEYS = (
 def save_session(token: str, user: User) -> None:
     """Persist token and user info to QSettings."""
     s = QgsSettings()
-    s.setValue(_KEY_TOKEN, token)
+    s.setValue(_KEY_AUTH, token)
     s.setValue(_KEY_USER_ID, user.user_id)
     s.setValue(_KEY_USER_NAME, user.full_name)
     s.setValue(_KEY_USER_EMAIL, user.email)
@@ -43,7 +44,7 @@ def restore_session():
     Returns (token, User) if a token exists, or (None, None) if not.
     """
     s = QgsSettings()
-    token = s.value(_KEY_TOKEN, None)
+    token = s.value(_KEY_AUTH, None)
     if not token:
         return None, None
 
