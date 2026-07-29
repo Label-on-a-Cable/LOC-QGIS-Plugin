@@ -18,46 +18,7 @@ deprecated=False
 
 changelog=
     1.6.0
-    - Cable routes that match no structures are now pushed with line-endpoint
-      coordinates instead of being silently dropped; the matched/unmatched
-      split is reported in Route Review and Push Preview
-    - Snap tolerance is now a user setting in the Category Mapping dialog
-      (persisted across sessions and in mapping presets; default 1.0 m,
-      raise to 5-10 m for CAD-derived data)
-    - Route Review header shows the snap tolerance used for generation
-    - Fixed duplicated snap tolerance default: DEFAULT_SNAP_TOLERANCE in
-      route_generator.py is now the single source of truth
-    - Delete detection now works: features deleted in QGIS after a pull are
-      excluded from the push payload so the server removes them (the push
-      endpoint is a full replacement), and Push Preview shows a
-      "Will be deleted on server" count before you confirm
-    - Maintenance: Qt6/QGIS 4 enum cleanup, narrower exception handling,
-      health-check and session housekeeping
-    1.5.1
-    - Migrated API base URL to dashboard.useloc.com/api/v1 (old domains now redirect, breaking POST requests)
-    - Location list now uses the v1 GET /locations endpoint (legacy endpoint removed on new backend)
-    - Location parsing supports both v1 flat and legacy nested response shapes
-    - Updated dashboard links to dashboard.useloc.com
-    1.5.0
-    - Full QGIS 4.0 / Qt6 compatibility (backward-compatible with QGIS 3.22+)
-    - Migrated all Qt5 scoped enums to Qt6 via compatibility shim layer
-    - Migrated deprecated QgsWkbTypes geometry enums to Qgis.GeometryType
-    - Migrated QVariant.String to QMetaType for QGIS 4.0 field creation
-    - Migrated API base URL to dashboard.loc.store
-    - Fixed category image parsing for dict-style API responses
-    1.4.1
-    - Fixed MD5 security flag (usedforsecurity=False for non-cryptographic fingerprint)
-    1.4.0
-    - Improved push workflow: faster updates, better change detection for field edits
-    1.3.0
-    - Added per-layer "Create in LOC" toggle to control which layers are included in push
-    - Added Select All / Deselect All controls for bulk layer toggling
-    - Added warning when disabled layers may cause data removal on push
-    - Fixed push-only workflows incorrectly warning about missing route generation
-    - Fixed post-push dashboard URL opening incorrect domain
-    1.2.0
-    - Fixed route reconstruction dropping stops at multi-stop coordinates
-    1.1.0
-    - Fixed S310 security warning, updated support email
-    1.0.0
-    - Initial production release
+    - Added a configurable snap tolerance setting for route generation
+    - Improved route generation so unmatched cable routes are no longer dropped
+    - Improved handling of deletions when pushing updates to LOC
+    - General maintenance and stability improvements
