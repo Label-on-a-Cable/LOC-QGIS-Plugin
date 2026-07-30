@@ -36,6 +36,9 @@ USER_ROLE = Qt.ItemDataRole.UserRole
 # Qt.ItemFlag
 ITEM_IS_SELECTABLE = Qt.ItemFlag.ItemIsSelectable
 
+# Qt.TextInteractionFlag
+TEXT_SELECTABLE = Qt.TextInteractionFlag.TextSelectableByMouse
+
 # Qt.WindowModality
 NON_MODAL = Qt.WindowModality.NonModal
 

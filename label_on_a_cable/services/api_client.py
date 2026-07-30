@@ -7,6 +7,7 @@ response handling, and one method per API endpoint.
 import json as _json
 import os
 import logging
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -22,6 +23,10 @@ from .exceptions import (
 BASE_URL = "https://dashboard.useloc.com/api/v1"
 DEFAULT_TIMEOUT = 30  # seconds
 PUSH_TIMEOUT = 180    # seconds (server statement_timeout = 120s)
+
+# Hosts the server may emit in media URLs by mistake — these are its own
+# nginx upstream address, not something a client machine can reach.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 _log = logging.getLogger("LOC.api_client")
 
@@ -131,6 +136,15 @@ class ApiClient:
             msg = data.get("error", data.get("message", "Forbidden"))
             raise AuthenticationException(str(msg), status_code=403)
 
+        # --- 413: request body rejected before the handler ran ---
+        if status == 413:
+            raise ValidationException(
+                "Payload too large — the server refused the request body "
+                "before processing it. Ask your administrator to raise the "
+                "JSON body limit on this endpoint.",
+                status_code=413,
+            )
+
         # --- 404: not found ---
         if status == 404:
             msg = data.get("error", data.get("message", "Resource not found"))
@@ -184,6 +198,70 @@ class ApiClient:
                 f"Request timed out after {timeout}s: {url}",
             ) from exc
         return self._handle_response(resp)
+
+    # ------------------------------------------------------------------
+    # Media assets (category icons)
+    # ------------------------------------------------------------------
+
+    def _rewrite_loopback(self, url):
+        """Point a loopback media URL back at the configured API host.
+
+        The deployed API emits its own upstream listen address
+        (``http://localhost:5000/...``) as if it were public, so the URL
+        is unreachable from a client machine.  Swap in the base URL's
+        scheme and host and keep the rest of the URL intact.
+        """
+        try:
+            parts = urlparse(url)
+        except ValueError:
+            return url
+        if parts.hostname and parts.hostname.lower() in _LOOPBACK_HOSTS:
+            base = urlparse(self.base_url)
+            return urlunparse(
+                parts._replace(scheme=base.scheme, netloc=base.netloc)
+            )
+        return url
+
+    def _media_get(self, url, timeout):
+        """GET a media URL, authenticating only on our own host."""
+        on_api_host = urlparse(url).netloc == urlparse(self.base_url).netloc
+        if on_api_host:
+            resp = self.session.get(url, timeout=timeout)
+        else:
+            # Off-host (e.g. pre-signed S3) — a stray Authorization
+            # header makes S3 reject the request.
+            resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp
+
+    def fetch_media(self, url, timeout=DEFAULT_TIMEOUT):
+        """Download a media asset and return its raw bytes.
+
+        Handles both server behaviours: a direct asset URL, and a
+        ``media/sign`` endpoint that answers with a JSON envelope
+        carrying a pre-signed URL to follow.
+        """
+        resp = self._media_get(self._rewrite_loopback(url), timeout)
+        if "json" not in resp.headers.get("Content-Type", "").lower():
+            return resp.content
+
+        try:
+            data = resp.json()
+        except ValueError:
+            return resp.content
+
+        if isinstance(data, str):
+            signed = data
+        elif isinstance(data, dict):
+            signed = (data.get("url") or data.get("signedUrl")
+                      or data.get("signed_url") or "")
+        else:
+            signed = ""
+        if not signed:
+            raise LOCAPIException(
+                f"Media response carried no signed URL: {url}"
+            )
+        return self._media_get(self._rewrite_loopback(signed), timeout).content
 
     # ------------------------------------------------------------------
     # Endpoint methods

@@ -1,5 +1,6 @@
 """QgsTask subclasses for off-thread operations."""
 
+import json as _json
 from typing import Dict, List, Optional
 
 import requests as _requests
@@ -14,6 +15,48 @@ from .route_generator import DEFAULT_SNAP_TOLERANCE
 from ..qt_compat import TASK_CAN_CANCEL
 from ..services.api_client import ApiClient
 from ..services.exceptions import AuthenticationException, LOCAPIException
+
+# Express's default JSON body limit; a payload above it is refused before
+# the route handler runs unless the server raises the limit explicitly.
+DEFAULT_BODY_LIMIT_BYTES = 100 * 1024
+
+
+def _sent_payload(payload: dict) -> dict:
+    """Strip internal sync metadata before sending to the server."""
+    return {k: v for k, v in payload.items() if not k.startswith("_")}
+
+
+def _payload_size(payload: dict) -> int:
+    """Serialized byte size of what actually goes on the wire."""
+    try:
+        return len(_json.dumps(payload).encode("utf-8"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def push_diagnostics(task) -> List[str]:
+    """Format a push/preview failure into user-facing diagnostic lines."""
+    lines = [task.error]
+    if task.status_code:
+        lines.append(f"HTTP status: {task.status_code}")
+    if task.request_id:
+        lines.append(f"Request-ID: {task.request_id}")
+    if task.elapsed_seconds:
+        lines.append(f"Elapsed: {task.elapsed_seconds:.1f}s")
+    if task.payload_bytes:
+        lines.append(f"Payload sent: {task.payload_bytes / 1024:.0f} KB")
+        # A 5xx on a body over the default limit usually means the body
+        # was rejected by the parser, not that anything in the data is
+        # wrong — worth saying so before the user hunts through layers.
+        over_limit = task.payload_bytes > DEFAULT_BODY_LIMIT_BYTES
+        if over_limit and task.status_code and task.status_code >= 500:
+            lines.append(
+                "This payload is larger than the default server body "
+                "limit (100 KB). If the server did not raise that limit "
+                "for this endpoint, the request is rejected before any "
+                "data is processed."
+            )
+    return lines
 
 
 class FetchLocationsTask(QgsTask):
@@ -70,10 +113,11 @@ class FetchCategoriesTask(QgsTask):
             img = cat.image if isinstance(cat.image, str) else ""
             if img and img.startswith(("http://", "https://")):
                 try:
-                    resp = _requests.get(img, timeout=5)
-                    resp.raise_for_status()
-                    self.icon_data[cat.category_id] = resp.content
-                except (_requests.RequestException, OSError) as exc:
+                    self.icon_data[cat.category_id] = self.api.fetch_media(
+                        img, timeout=5,
+                    )
+                except (_requests.RequestException, OSError,
+                        LOCAPIException) as exc:
                     QgsMessageLog.logMessage(
                         f"Icon download failed for {img}: {exc}",
                         "LOC", Qgis.MessageLevel.Warning,
@@ -94,12 +138,12 @@ class PushPreviewTask(QgsTask):
         self.status_code: Optional[int] = None
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
+        self.payload_bytes: int = 0
 
     def run(self):
         try:
-            # Strip internal sync metadata before sending to server
-            send_payload = {k: v for k, v in self.payload.items()
-                           if not k.startswith("_")}
+            send_payload = _sent_payload(self.payload)
+            self.payload_bytes = _payload_size(send_payload)
             data = self.api.push_locs(send_payload, preview=True)
             QgsMessageLog.logMessage(
                 f"Preview raw response: {data}", "LOC", Qgis.MessageLevel.Warning,
@@ -136,12 +180,12 @@ class PushTask(QgsTask):
         self.status_code: Optional[int] = None
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
+        self.payload_bytes: int = 0
 
     def run(self):
         try:
-            # Strip internal sync metadata before sending to server
-            send_payload = {k: v for k, v in self.payload.items()
-                           if not k.startswith("_")}
+            send_payload = _sent_payload(self.payload)
+            self.payload_bytes = _payload_size(send_payload)
             data = self.api.push_locs(send_payload, preview=False)
             if isinstance(data, dict):
                 self.message = data.get("message", "Push complete.")

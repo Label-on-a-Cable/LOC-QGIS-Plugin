@@ -723,15 +723,8 @@ class LabelOnACablePlugin:
 
         if task.error:
             # Build detailed diagnostic message
-            detail_lines = [task.error]
-            if task.status_code:
-                detail_lines.append(f"HTTP status: {task.status_code}")
-            if task.request_id:
-                detail_lines.append(f"Request-ID: {task.request_id}")
-            if task.elapsed_seconds:
-                detail_lines.append(
-                    f"Elapsed: {task.elapsed_seconds:.1f}s"
-                )
+            from .core.tasks import push_diagnostics
+            detail_lines = push_diagnostics(task)
 
             # Distinguish true network failures from server-side 500s.
             # The server sometimes returns HTTP 500 (with a validation

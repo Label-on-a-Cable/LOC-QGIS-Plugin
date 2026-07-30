@@ -21,4 +21,6 @@ changelog=
     - Added a configurable snap tolerance setting for route generation
     - Improved route generation so unmatched cable routes are no longer dropped
     - Improved handling of deletions when pushing updates to LOC
+    - Fixed category icons failing to load in Category Mapping
+    - Clearer errors when a push is rejected, including the size of the data sent
     - General maintenance and stability improvements

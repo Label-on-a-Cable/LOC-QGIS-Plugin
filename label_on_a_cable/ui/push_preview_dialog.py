@@ -24,8 +24,8 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication
 
-from ..qt_compat import BB_OK, BB_CANCEL
-from ..core.tasks import PushPreviewTask
+from ..qt_compat import BB_OK, BB_CANCEL, TEXT_SELECTABLE
+from ..core.tasks import PushPreviewTask, push_diagnostics
 from ..services.api_client import ApiClient
 
 
@@ -122,6 +122,8 @@ class PushPreviewDialog(QDialog):
         self._server_group = QGroupBox("Server Response")
         self._server_layout = QVBoxLayout(self._server_group)
         self._server_status = QLabel("Validating with server (no data written yet)...")
+        self._server_status.setWordWrap(True)  # diagnostics can be long
+        self._server_status.setTextInteractionFlags(TEXT_SELECTABLE)
         self._server_layout.addWidget(self._server_status)
         root.addWidget(self._server_group)
 
@@ -167,14 +169,7 @@ class PushPreviewDialog(QDialog):
                                or "502" in task.error
                                or "503" in task.error)
 
-            # Build diagnostic detail text
-            detail_parts = [task.error]
-            if task.status_code:
-                detail_parts.append(f"HTTP {task.status_code}")
-            if task.request_id:
-                detail_parts.append(f"Request-ID: {task.request_id}")
-            if task.elapsed_seconds:
-                detail_parts.append(f"Elapsed: {task.elapsed_seconds:.1f}s")
+            detail_parts = push_diagnostics(task)
             detail_parts.append(
                 "\nCheck server connectivity, then try again. "
                 "If the problem persists, contact your administrator."
