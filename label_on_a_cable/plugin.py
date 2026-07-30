@@ -777,7 +777,9 @@ class LabelOnACablePlugin:
         import webbrowser
         if self.active_location:
             loc_id = self.active_location.location_id
-            webbrowser.open(f"https://dashboard.useloc.com/viewlocs/{loc_id}")
+            webbrowser.open(
+                f"https://dashboard.useloc.com/locations/{loc_id}/locs"
+            )
         else:
             webbrowser.open("https://www.loc.store")
 

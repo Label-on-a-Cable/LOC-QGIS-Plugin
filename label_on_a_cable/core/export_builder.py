@@ -462,10 +462,15 @@ def stamp_ids_after_push(payload: dict) -> int:
             entry["_createdAt"] = attrs.get("createdAt", "")
             entry["_updatedAt"] = attrs.get("updatedAt", "")
             entry["_wrapper_id"] = sloc.get("id", "")
+            # Identity lives on the outer record, not in `attributes` —
+            # `_build_standalone_single_locs()` never puts it there.  Reading
+            # it from `attrs` stamped the hash over ("", ""), so the rebuild
+            # (which uses the real values) could never match and every
+            # standalone asset had updatedAt bumped on every push.
             entry["_fields_hash"] = _fields_fingerprint(
                 attrs.get("fields", {}),
-                attrs.get("unique_asset_id", ""),
-                attrs.get("actual_asset_name", ""),
+                sloc.get("unique_asset_id", ""),
+                sloc.get("actual_asset_name", ""),
             )
 
         if entry:
@@ -1147,6 +1152,53 @@ def _build_dual_loc_obj(
 
 
 # ------------------------------------------------------------------
+# Stop identity
+# ------------------------------------------------------------------
+
+def _stop_identity(
+    stop: Stop,
+    pt_feature: Optional[QgsFeature],
+    pt_mapping: Optional[LayerMapping],
+    route_uid: str,
+) -> Tuple[str, str]:
+    """Return ``(unique_asset_id, actual_asset_name)`` for a route stop.
+
+    The reviewed label wins: it carries the naming convention
+    (``<LineName>_<Structure>`` with ``_IN``/``_OUT`` for ingress/egress
+    pairs) plus any rename the user made in the review dialog.  Without
+    it, an IN/OUT pair pushes as two LOCs with the same identity and the
+    server disambiguates the second with a bare ``_<stopNumber>`` suffix,
+    so neither the pairing nor the rename is visible in LOC.
+
+    The route prefix is only added when the label does not already start
+    with it — labels generated from the line name usually do, but a
+    mapped "Route ID" that differs from the line name still needs it to
+    stay unique across routes.
+
+    Falls back to the POINT feature's mapped identity (never the line
+    feature — all stops on a route share one line feature, so that would
+    give every stop the same identity).
+    """
+    label = stop.display_name or stop.original_name
+    if label:
+        if route_uid and not label.startswith(f"{route_uid}_"):
+            return f"{route_uid}_{label}", label
+        return label, label
+
+    pt_uid_qfield = pt_mapping.qgis_field_for("Unique Asset Identifier") if pt_mapping else ""
+    asset_uid = _safe_value(pt_feature, pt_uid_qfield) if pt_uid_qfield and pt_feature else ""
+    pt_aan_qfield = pt_mapping.qgis_field_for("Actual Asset Name") if pt_mapping else ""
+    actual_asset_name = _safe_value(pt_feature, pt_aan_qfield) if pt_aan_qfield and pt_feature else ""
+    if not asset_uid:
+        asset_uid = actual_asset_name
+    if not actual_asset_name:
+        actual_asset_name = asset_uid
+
+    unique_asset_id = f"{route_uid}_{asset_uid}" if route_uid else asset_uid
+    return unique_asset_id, actual_asset_name
+
+
+# ------------------------------------------------------------------
 # Single LOC object builder  (stop within a multiLoc)
 # ------------------------------------------------------------------
 
@@ -1226,25 +1278,9 @@ def _build_single_loc_obj(
         _SINGLE_KNOWN | _DUAL_ORIGIN_KNOWN, top_prefix="field",
     )
 
-    # Essential fields (uid / name) ALWAYS come from the POINT feature
-    # (the physical asset at the stop), never from the line feature.
-    # All stops on a route share the same line feature, so reading from
-    # it would give every stop the same identity.
-    pt_uid_qfield = pt_mapping.qgis_field_for("Unique Asset Identifier") if pt_mapping else ""
-    asset_uid = _safe_value(pt_feature, pt_uid_qfield) if pt_uid_qfield and pt_feature else ""
-    if not asset_uid:
-        pt_name_qfield = pt_mapping.qgis_field_for("Actual Asset Name") if pt_mapping else ""
-        asset_uid = _safe_value(pt_feature, pt_name_qfield) if pt_name_qfield and pt_feature else ""
-    if not asset_uid:
-        asset_uid = stop.display_name
-
-    pt_aan_qfield = pt_mapping.qgis_field_for("Actual Asset Name") if pt_mapping else ""
-    actual_asset_name = _safe_value(pt_feature, pt_aan_qfield) if pt_aan_qfield and pt_feature else ""
-    if not actual_asset_name:
-        actual_asset_name = asset_uid
-
-    # Composite unique_asset_id: route ID + asset ID (guaranteed unique)
-    unique_asset_id = f"{route_uid}_{asset_uid}" if route_uid else asset_uid
+    unique_asset_id, actual_asset_name = _stop_identity(
+        stop, pt_feature, pt_mapping, route_uid,
+    )
 
     entry = {
         "loc_id": loc_id,
@@ -1790,16 +1826,11 @@ def _rebuild_stops_from_raw(
                 patched_sloc["origin_longitude"] = pt_xy[0]
                 patched_sloc["origin_latitude"] = pt_xy[1]
 
-            # Patch identity fields from current point feature
+            # Patch identity fields from the reviewed label / point feature
             pt_mapping = mapping_by_layer.get(stop.point_layer_id)
-            pt_uid_qfield = pt_mapping.qgis_field_for("Unique Asset Identifier") if pt_mapping else ""
-            asset_uid = _safe_value(pt_feature, pt_uid_qfield) if pt_uid_qfield and pt_feature else ""
-            if not asset_uid:
-                pt_name_qfield = pt_mapping.qgis_field_for("Actual Asset Name") if pt_mapping else ""
-                asset_uid = _safe_value(pt_feature, pt_name_qfield) if pt_name_qfield and pt_feature else ""
-            if not asset_uid:
-                asset_uid = stop.display_name
-            new_base_uid = f"{route_uid}_{asset_uid}" if route_uid else asset_uid
+            new_base_uid, actual_name = _stop_identity(
+                stop, pt_feature, pt_mapping, route_uid,
+            )
             # Preserve original unique_asset_id if the base matches — the
             # server may have added a disambiguation suffix (e.g. "_3") for
             # egress stops in IN/OUT pairs. The server needs the suffix
@@ -1810,10 +1841,6 @@ def _rebuild_stops_from_raw(
             else:
                 patched_sloc["unique_asset_id"] = new_base_uid
 
-            pt_aan_qfield = pt_mapping.qgis_field_for("Actual Asset Name") if pt_mapping else ""
-            actual_name = _safe_value(pt_feature, pt_aan_qfield) if pt_aan_qfield and pt_feature else ""
-            if not actual_name:
-                actual_name = asset_uid
             patched_sloc["actual_asset_name"] = actual_name
             patched_sloc["location_id"] = location.location_id
 
