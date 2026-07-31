@@ -1,6 +1,7 @@
 """QgsTask subclasses for off-thread operations."""
 
 import json as _json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 import requests as _requests
@@ -108,20 +109,29 @@ class FetchCategoriesTask(QgsTask):
             self.error = f"Unexpected error: {exc}"
             return False
 
-        # Download category icons (best-effort, skip failures silently)
-        for cat in self.categories:
+        # Download category icons (best-effort, skip failures silently).
+        # Concurrently: each icon costs up to two round-trips (media/sign
+        # envelope, then the pre-signed URL) and the dialog stays on
+        # "Loading categories..." until every one lands — serially that
+        # dominated the load time.
+        def _fetch_icon(cat):
             img = cat.image if isinstance(cat.image, str) else ""
-            if img and img.startswith(("http://", "https://")):
-                try:
-                    self.icon_data[cat.category_id] = self.api.fetch_media(
-                        img, timeout=5,
-                    )
-                except (_requests.RequestException, OSError,
-                        LOCAPIException) as exc:
-                    QgsMessageLog.logMessage(
-                        f"Icon download failed for {img}: {exc}",
-                        "LOC", Qgis.MessageLevel.Warning,
-                    )
+            if not img.startswith(("http://", "https://")):
+                return None
+            try:
+                return cat.category_id, self.api.fetch_media(img, timeout=5)
+            except (_requests.RequestException, OSError,
+                    LOCAPIException) as exc:
+                QgsMessageLog.logMessage(
+                    f"Icon download failed for {img}: {exc}",
+                    "LOC", Qgis.MessageLevel.Warning,
+                )
+                return None
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for result in pool.map(_fetch_icon, self.categories):
+                if result:
+                    self.icon_data[result[0]] = result[1]
         return True
 
 
