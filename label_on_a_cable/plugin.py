@@ -529,8 +529,37 @@ class LabelOnACablePlugin:
         """Clean up reference when the review dialog is closed."""
         self._review_dlg = None
 
+    def _require_saved_project(self, action: str) -> bool:
+        """Block *action* unless the QGIS project has been saved to disk.
+
+        The stamp cache lives beside the project file, so an unsaved project
+        makes ``_get_stamp_cache_path()`` return None: nothing is written, no
+        LOC IDs persist, and every subsequent push looks like a fresh create.
+        Pull has the matching problem — its output lands in the user profile
+        folder instead of beside the project.
+        """
+        from qgis.core import QgsProject
+
+        if QgsProject.instance().absoluteFilePath():
+            return True
+
+        QMessageBox.critical(
+            self.iface.mainWindow(),
+            "Save the QGIS Project First",
+            f"This project has not been saved, so {action} cannot continue.\n\n"
+            "LOC record IDs are stored in a sidecar file next to the project "
+            "(MyProject.qgz → MyProject_loc_stamps.json). Without a project "
+            "file there is nowhere to write them, so LOC would treat every "
+            "later push as brand-new records instead of updates.\n\n"
+            "Save the project, then try again.",
+        )
+        return False
+
     def _on_push(self):
         """Build export payload, validate, show preview, then push."""
+        if not self._require_saved_project("the push"):
+            return
+
         if not self.active_location:
             self.iface.messageBar().pushWarning(
                 self.PLUGIN_NAME,
@@ -775,13 +804,13 @@ class LabelOnACablePlugin:
     def _open_loc_page(self):
         """Open the LOC web page for the active location."""
         import webbrowser
+        from .services.config import get_base_url
+        base = get_base_url()
         if self.active_location:
             loc_id = self.active_location.location_id
-            webbrowser.open(
-                f"https://dashboard.useloc.com/locations/{loc_id}/locs"
-            )
+            webbrowser.open(f"{base}/locations/{loc_id}/locs")
         else:
-            webbrowser.open("https://www.loc.store")
+            webbrowser.open(base)
 
     # ------------------------------------------------------------------
     # Pull from LOC
@@ -789,6 +818,9 @@ class LabelOnACablePlugin:
 
     def _on_pull(self):
         """Open the pull dialog to import LOC data into QGIS layers."""
+        if not self._require_saved_project("the pull"):
+            return
+
         if not self.active_location:
             self.iface.messageBar().pushWarning(
                 self.PLUGIN_NAME,

@@ -13,8 +13,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..models.user import User
-
-DASHBOARD_URL = "https://dashboard.useloc.com"
+from ..services.config import get_base_url
 
 
 class UserDetailsDialog(QDialog):
@@ -73,7 +72,7 @@ class UserDetailsDialog(QDialog):
         layout.addLayout(btn_row)
 
     def _open_dashboard(self):
-        webbrowser.open(DASHBOARD_URL)
+        webbrowser.open(get_base_url())
 
     def _on_sync(self):
         self.sync_requested.emit()

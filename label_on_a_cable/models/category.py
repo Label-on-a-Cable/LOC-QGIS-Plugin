@@ -32,11 +32,20 @@ class CategoryField:
 
 
 def _parse_image(raw) -> str:
-    """Extract image URL from string or dict (API may return either)."""
+    """Extract image URL from string or dict (API may return either).
+
+    When the icon lives in the private media bucket, the API adds a
+    presigned ``signedUrl`` to the image object and leaves ``url`` as
+    the raw bucket URL — which S3 rejects (403) for anonymous requests.
+    Prefer ``signedUrl``; the plain keys only work for public assets.
+    """
     if isinstance(raw, str):
         return raw
     if isinstance(raw, dict):
-        return raw.get("url", raw.get("src", ""))
+        for key in ("signedUrl", "url", "black", "green", "red", "src"):
+            val = raw.get(key)
+            if isinstance(val, str) and val:
+                return val
     return ""
 
 

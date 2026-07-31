@@ -63,6 +63,25 @@ _DUAL_ORIGIN_KNOWN = {"route id", "origin", "unique asset identifier",
                       "actual asset name"}
 _DUAL_DEST_KNOWN = {"destination"}
 
+# OMITTED PLUGIN-WRITABLE KEYS — keys the from-scratch builders must NOT send.
+#
+# The push endpoint's diff (`originDiff` / `destinationDiff` in loc-next's
+# plugin.service.ts) treats *present* as "write this" and *absent* as "leave
+# alone" — a hardcoded default is indistinguishable from a deliberate edit.
+# Sending `origin_status="unassigned"`, `notes=None`, `transaction_id=None`,
+# `origin_radius=None` and their destination twins therefore reverted status
+# set by field crews, wiped server-side notes and GNSS-captured radii, and
+# made every push report an update forever, even on an otherwise
+# byte-identical payload.
+#
+# Omitting them is a no-op on create — the server already defaults status to
+# "unassigned" and the rest to null — and non-destructive on update.
+#
+# This applies only to records built from scratch, where the plugin does not
+# know the server's value.  The patch paths (`_patch_dual_loc`,
+# `_patch_standalone_sloc`, `_rebuild_stops_from_raw`) start from pulled JSON
+# and carry the real values, so they keep sending them.
+
 
 def _fields_fingerprint(*values) -> str:
     """Compute a short hash of field values for change detection."""
@@ -102,9 +121,9 @@ def build_payload(
     _active_location_id = location.location_id
     _current_stamp_layer = None
 
-    # Re-key stamp cache entries if memory layer UIDs changed
-    # (e.g. after route regeneration).
-    _migrate_stamps_for_routes(routes, location.location_id)
+    # Re-key stamp cache entries if layer source strings changed
+    # (e.g. after route regeneration, or a pull into memory layers).
+    _migrate_stamps(routes, layer_mappings, location.location_id)
 
     mapping_by_layer: Dict[str, LayerMapping] = {
         lm.layer_id: lm for lm in layer_mappings
@@ -442,6 +461,7 @@ def stamp_ids_after_push(payload: dict) -> int:
             entry["_loc_id"] = dloc.get("loc_id", "")
             entry["_origin_id"] = dloc.get("origin_id", "")
             entry["_dest_id"] = dest.get("destination_id", "")
+            entry["_unique_asset_id"] = dloc.get("unique_asset_id", "")
             entry["_createdAt"] = dloc.get("createdAt", "")
             entry["_updatedAt"] = dloc.get("updatedAt", "")
             entry["_dest_createdAt"] = dest.get("createdAt", "")
@@ -459,6 +479,7 @@ def stamp_ids_after_push(payload: dict) -> int:
             attrs = sloc.get("attributes", {})
             entry["_loc_id"] = attrs.get("loc_id", "")
             entry["_origin_id"] = attrs.get("origin_id", "")
+            entry["_unique_asset_id"] = sloc.get("unique_asset_id", "")
             entry["_createdAt"] = attrs.get("createdAt", "")
             entry["_updatedAt"] = attrs.get("updatedAt", "")
             entry["_wrapper_id"] = sloc.get("id", "")
@@ -523,6 +544,7 @@ def sync_stamps_from_server(
             server_index[uid] = {
                 "_loc_id": sloc.get("loc_id", ""),
                 "_origin_id": sloc.get("origin_id", ""),
+                "_unique_asset_id": uid,
                 "_createdAt": sloc.get("createdAt", ""),
                 "_updatedAt": sloc.get("updatedAt", ""),
                 "_wrapper_id": sloc.get("id", str(uuid4())),
@@ -539,6 +561,7 @@ def sync_stamps_from_server(
                 "_loc_id": dloc.get("loc_id", ""),
                 "_origin_id": dloc.get("origin_id", ""),
                 "_dest_id": dest.get("destination_id", ""),
+                "_unique_asset_id": uid,
                 "_createdAt": dloc.get("createdAt", ""),
                 "_updatedAt": dloc.get("updatedAt", ""),
                 "_dest_createdAt": dest.get("createdAt", ""),
@@ -701,18 +724,20 @@ def _stamp_cache_key(layer: QgsVectorLayer, fid: int) -> str:
     return f"{layer.source()}:{fid}"
 
 
-def _migrate_stamps_for_routes(
+def _migrate_stamps(
     routes: List["Route"],
+    layer_mappings: List[LayerMapping],
     location_id: str,
 ) -> int:
-    """Re-key stamp cache entries after route regeneration.
+    """Re-key stamp cache entries whose layer source string changed.
 
-    Memory layer UIDs change when routes are regenerated, breaking the
-    primary cache key (layer.source():fid).  This scans cached entries
-    for a ``_route_name`` field and copies them under the new key so
-    subsequent ``_safe_value`` lookups succeed.
+    The primary cache key is ``layer.source():fid``, so anything that
+    changes a layer's source string orphans its entries — route
+    regeneration and Pull both do, since memory layers carry a generated
+    uid in that string.  Route entries are recovered via ``_route_name``;
+    everything else via ``_unique_asset_id``.
 
-    Returns the number of entries migrated.
+    Returns the total number of entries migrated.
     """
     cache = _load_stamp_cache()
     loc_stamps = cache.get(location_id)
@@ -720,7 +745,24 @@ def _migrate_stamps_for_routes(
         return 0
 
     project = QgsProject.instance()
+    migrated = _migrate_route_stamps(project, loc_stamps, routes)
+    migrated += _migrate_asset_stamps(project, loc_stamps, layer_mappings)
 
+    if migrated:
+        _save_stamp_cache(cache)
+        QgsMessageLog.logMessage(
+            f"Migrated {migrated} stamp cache entries to current layers",
+            "LOC Export", Qgis.MessageLevel.Info,
+        )
+    return migrated
+
+
+def _migrate_route_stamps(
+    project: QgsProject,
+    loc_stamps: Dict[str, dict],
+    routes: List["Route"],
+) -> int:
+    """Re-key route (multi/dual line) entries by ``_route_name``."""
     # Build reverse index: route_name → (old_key, entry)
     by_route_name: Dict[str, tuple] = {}
     for old_key, entry in loc_stamps.items():
@@ -752,12 +794,74 @@ def _migrate_stamps_for_routes(
         loc_stamps[new_key] = entry
         migrated += 1
 
-    if migrated:
-        _save_stamp_cache(cache)
-        QgsMessageLog.logMessage(
-            f"Migrated {migrated} stamp cache entries to current layers",
-            "LOC Export", Qgis.MessageLevel.Info,
-        )
+    return migrated
+
+
+def _migrate_asset_stamps(
+    project: QgsProject,
+    loc_stamps: Dict[str, dict],
+    layer_mappings: List[LayerMapping],
+) -> int:
+    """Re-key standalone asset entries by ``_unique_asset_id``.
+
+    Single-LOC entries never carry a ``_route_name``, so
+    ``_migrate_route_stamps`` cannot recover them: on a pull-then-push
+    cycle every standalone asset orphans and re-pushes as a create.
+    Matching is on the identity the server itself matches on — the
+    feature's mapped Unique Asset Identifier.
+
+    Entries written before ``_unique_asset_id`` was stamped have nothing
+    to match against and are skipped; the next successful push adds the
+    field, so the cache self-heals.
+    """
+    by_uid: Dict[str, dict] = {}
+    for entry in loc_stamps.values():
+        # Routes are handled by _migrate_route_stamps — leaving them out
+        # keeps the two passes from fighting over the same key.
+        if entry.get("_route_name"):
+            continue
+        uid = entry.get("_unique_asset_id", "")
+        if uid:
+            by_uid[uid] = entry
+
+    if not by_uid:
+        return 0
+
+    migrated = 0
+    for lm in layer_mappings:
+        if not lm.category_id:
+            continue
+        layer = project.mapLayer(lm.layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+        if layer.geometryType() == GEOM_LINE:
+            continue  # route layers: handled by _migrate_route_stamps
+
+        uid_qfield = lm.qgis_field_for("Unique Asset Identifier")
+        if not uid_qfield:
+            continue
+
+        for feat in layer.getFeatures():
+            if not feat.isValid():
+                continue
+            try:
+                feat_uid = feat.attribute(uid_qfield)
+            except (KeyError, RuntimeError):
+                continue
+            if not feat_uid or str(feat_uid) == "NULL":
+                continue
+            entry = by_uid.get(str(feat_uid).strip())
+            if entry is None:
+                continue
+
+            new_key = _stamp_cache_key(layer, feat.id())
+            # After a FID renumber, new_key may already hold a *different*
+            # asset's entry — same guard as the route pass.
+            if loc_stamps.get(new_key) is entry:
+                continue
+            loc_stamps[new_key] = entry
+            migrated += 1
+
     return migrated
 
 
@@ -1102,26 +1206,24 @@ def _build_dual_loc_obj(
             cached_ua = now
             cached_dua = now
 
+    # `origin_status`, `notes` and `transaction_id` are deliberately absent —
+    # see the module-level "OMITTED PLUGIN-WRITABLE KEYS" note.
     entry = {
         "loc_id": loc_id,
         "unique_asset_id": unique_asset_id,
         "origin_id": origin_id,
         "actual_asset_name": actual_asset_name,
         "is_flagged": False,
-        "notes": None,
         "notes_history": [],
         "imageNotes": [],
         "audioNotes": [],
         "videoNotes": [],
-        "origin_status": "unassigned",
         "LOC_type": "dual",
         "category": mapping.category_id,
         "fields": origin_sub,
         "hard_lock": 0,
         "origin_longitude": origin_xy[0],
         "origin_latitude": origin_xy[1],
-        "origin_radius": None,
-        "transaction_id": None,
         "createdAt": cached_ca or now,
         "updatedAt": cached_ua or now,
         "location_id": location_id,
@@ -1132,10 +1234,7 @@ def _build_dual_loc_obj(
             "destination": destination,
             "longitude": dest_xy[0],
             "latitude": dest_xy[1],
-            "radius": None,
-            "destination_status": "unassigned",
             "hard_lock": 0,
-            "destination_transaction_id": None,
             "destination_fields": dest_sub,
             "createdAt": cached_dca or now,
             "updatedAt": cached_dua or now,
@@ -1282,26 +1381,24 @@ def _build_single_loc_obj(
         stop, pt_feature, pt_mapping, route_uid,
     )
 
+    # `origin_status`, `notes` and `transaction_id` are deliberately absent —
+    # see the module-level "OMITTED PLUGIN-WRITABLE KEYS" note.
     entry = {
         "loc_id": loc_id,
         "unique_asset_id": unique_asset_id,
         "origin_id": origin_id,
         "actual_asset_name": actual_asset_name,
         "is_flagged": False,
-        "notes": None,
         "notes_history": [],
         "imageNotes": [],
         "audioNotes": [],
         "videoNotes": [],
-        "origin_status": "unassigned",
         "LOC_type": "single",
         "category": cat_id,
         "fields": sub_fields,
         "hard_lock": 0,
         "origin_longitude": pt_xy[0],
         "origin_latitude": pt_xy[1],
-        "origin_radius": None,
-        "transaction_id": None,
         "createdAt": matched_created_at or now,
         # Bump updatedAt when stopNumber changed (signals server to reprocess)
         "updatedAt": (now if (orig_stop_num and orig_stop_num != stop_number)
@@ -1420,12 +1517,12 @@ def _build_standalone_single_locs(
             # Server processes single_locs through a separate code path
             # that expects "category_id" (not "category") and a lean
             # attribute set.
+            # `origin_status` and `notes` are deliberately absent — see the
+            # module-level "OMITTED PLUGIN-WRITABLE KEYS" note.
             attrs = {
                 "loc_id": loc_id,
                 "origin_id": origin_id,
                 "is_flagged": False,
-                "notes": None,
-                "origin_status": "unassigned",
                 "LOC_type": "single",
                 "fields": sub_fields,
                 "origin_longitude": pt_xy[0],
@@ -2322,5 +2419,12 @@ def _float_val(val) -> float:
 
 
 def _now_iso() -> str:
-    """Current UTC timestamp in ISO 8601 format."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    """Current UTC timestamp in ISO 8601 format.
+
+    Matches the shape the server emits (``2026-07-30T14:33:17.662Z``):
+    millisecond precision with an explicit UTC marker.  Without the ``Z``
+    the value reads as a naive local time to anything that parses it —
+    moot for single LOCs, where the server authors its own timestamps,
+    but the client value is retained for duals.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"

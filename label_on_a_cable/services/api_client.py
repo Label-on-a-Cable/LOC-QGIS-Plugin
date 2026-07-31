@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 
+from .config import get_api_base_url
 from .exceptions import (
     AuthenticationException,
     LOCAPIException,
@@ -19,8 +20,6 @@ from .exceptions import (
     ServerException,
     ValidationException,
 )
-
-BASE_URL = "https://dashboard.useloc.com/api/v1"
 DEFAULT_TIMEOUT = 30  # seconds
 PUSH_TIMEOUT = 180    # seconds (server statement_timeout = 120s)
 
@@ -45,8 +44,8 @@ def _extract_request_id(headers) -> str:
 class ApiClient:
     """Low-level HTTP client for every LOC API endpoint."""
 
-    def __init__(self, base_url=BASE_URL):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url=None):
+        self.base_url = (base_url or get_api_base_url()).rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
