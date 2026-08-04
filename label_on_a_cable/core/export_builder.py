@@ -136,6 +136,10 @@ def build_payload(
     # Maps payload entries back to layer features for post-push ID sync.
     # Each entry: {"layer_id": str, "feature_id": int, "type": "multi"|"dual"}
     _feature_map: List[dict] = []
+    # multiLoc id → stops omitted because their point feature was deleted
+    # after generation.  validate_payload subtracts these from the pulled
+    # stop counts so an intentional delete doesn't trip the invariant.
+    _stale_stop_drops: Dict[str, int] = {}
 
     for route in routes:
         line_mapping = mapping_by_layer.get(route.line_layer_id)
@@ -160,9 +164,29 @@ def build_payload(
             route, project, transforms,
         )
 
-        # _route_endpoint_coords calls _get_feature on point layers,
-        # which overwrites _current_stamp_layer.  Restore the line
-        # layer so _build_dual_loc_obj looks up the right cache entry.
+        # Same rule as the missing line feature above: a stop whose point
+        # feature was deleted after generation must be left out — omission
+        # IS the delete.  Emitting it would push the stop at (0, 0), the
+        # missing-feature coordinate fallback.
+        intermediates: List[Stop] = []
+        stale_drops = 0
+        for stop in route.intermediate_stops:
+            if _get_feature(project, stop.point_layer_id,
+                            stop.point_feature_id) is None:
+                stale_drops += 1
+                QgsMessageLog.logMessage(
+                    f"Stop '{stop.display_name}' of route "
+                    f"'{route.line_name}': point feature no longer exists "
+                    f"— omitting from push (server deletes it)",
+                    "LOC", Qgis.MessageLevel.Warning,
+                )
+            else:
+                intermediates.append(stop)
+
+        # _route_endpoint_coords / the stale-stop check call _get_feature
+        # on point layers, which overwrites _current_stamp_layer.  Restore
+        # the line layer so _build_dual_loc_obj looks up the right cache
+        # entry.
         _line_layer = project.mapLayer(route.line_layer_id)
         if isinstance(_line_layer, QgsVectorLayer):
             _set_current_layer(_line_layer)
@@ -173,7 +197,6 @@ def build_payload(
             location.location_id, user_id, now,
         )
 
-        intermediates = route.intermediate_stops
         fmap_entry = {"layer_id": route.line_layer_id,
                       "feature_id": route.line_feature_id}
         if not intermediates:
@@ -207,6 +230,8 @@ def build_payload(
                     location, user_id, now,
                 )
                 mloc_entry["Stops"] = rebuilt_stops
+                if stale_drops:
+                    _stale_stop_drops[mloc_entry["id"]] = stale_drops
 
                 # Always include — server deletes LOCs not in the push.
                 multi_locs.append(mloc_entry)
@@ -273,8 +298,11 @@ def build_payload(
                         "singleLoc": single_loc,
                     })
 
+                mloc_id = multi_id or str(uuid4())
+                if stale_drops:
+                    _stale_stop_drops[mloc_id] = stale_drops
                 multi_locs.append({
-                    "id": multi_id or str(uuid4()),
+                    "id": mloc_id,
                     "multiName": route.line_name,
                     "Stops": stops_arr,
                     "dualLoc": dual_loc,
@@ -304,6 +332,9 @@ def build_payload(
         # Internal: maps payload entries → layer features for post-push sync.
         # Stripped before sending to server.
         "_feature_map": _feature_map,
+        # Internal: stops omitted because their point feature was deleted
+        # (see the stale-stop check above).  Stripped before sending.
+        "_stale_stop_drops": _stale_stop_drops,
     }
 
     if pulled_loc_ids:
@@ -982,14 +1013,18 @@ def validate_payload(
             ))
 
     # Invariant 3: On pull→push with no regeneration, per-route stop
-    # counts must remain unchanged.
+    # counts must remain unchanged — except for stops build_payload
+    # dropped because their point feature was deleted (an intentional
+    # delete, not accidental loss).
     if expected_stop_counts:
+        stale_drops = payload.get("_stale_stop_drops", {})
         level = "error" if counts_authoritative else "warning"
         for ml in multi:
             mid = ml.get("id", "")
             name = ml.get("multiName", "?")
             if mid and mid in expected_stop_counts:
-                expected_n = expected_stop_counts[mid]
+                expected_n = (expected_stop_counts[mid]
+                              - stale_drops.get(mid, 0))
                 actual_n = len(ml.get("Stops", []))
                 if actual_n != expected_n:
                     issues.append((
