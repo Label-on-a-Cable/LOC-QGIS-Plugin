@@ -8,6 +8,10 @@
 !label_on_a_cable/
 !label_on_a_cable/**
 
+# Include unit tests (plain Python, no QGIS required)
+!tests/
+!tests/**
+
 # Exclude generated/temporary files within the plugin
 __pycache__/
 *.pyc

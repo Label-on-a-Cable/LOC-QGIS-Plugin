@@ -5,9 +5,9 @@ Fetches locations via QgsTask on first show / refresh.
 Emits ``location_selected`` when the user picks a location.
 """
 
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QDockWidget,
     QHBoxLayout,
@@ -21,6 +21,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import QgsApplication
 
 from ..qt_compat import LEFT_DOCK, RIGHT_DOCK, USER_ROLE, ITEM_IS_SELECTABLE
+from ..core.grouping import group_locations
 from ..core.tasks import FetchLocationsTask
 from ..models.location import Location
 from ..services.api_client import ApiClient
@@ -62,7 +63,7 @@ class LocationSidebar(QDockWidget):
         # Description
         desc = QLabel(
             "Select a location to work with. "
-            "Locations are grouped by Global Identifier."
+            "Locations are grouped by Global Identifier and Project."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet("color: gray; font-size: 11px;")
@@ -157,25 +158,29 @@ class LocationSidebar(QDockWidget):
             self._status.setVisible(True)
             return
 
-        # Group: GID name → [Location, ...]
-        # The API Project object has no name field, so we use a
-        # two-level tree: Global Identifier → Location.
-        gid_map: Dict[str, List[Location]] = {}
-        for loc in self._locations:
-            gid_name = loc.project.global_identifier.name or "(No GID)"
-            gid_map.setdefault(gid_name, []).append(loc)
-
-        for gid_name in sorted(gid_map):
-            count = len(gid_map[gid_name])
+        for gid_name, projects in group_locations(self._locations):
+            count = sum(len(locs) for _, locs in projects)
             display = f"{gid_name} ({count} location{'s' if count != 1 else ''})"
             gid_item = QTreeWidgetItem([display])
             gid_item.setFlags(gid_item.flags() & ~ITEM_IS_SELECTABLE)
             self._tree.addTopLevelItem(gid_item)
 
-            for loc in sorted(gid_map[gid_name], key=lambda item: item.name):
-                loc_item = QTreeWidgetItem([loc.name])
-                loc_item.setData(0, USER_ROLE, loc)
-                gid_item.addChild(loc_item)
+            for project_name, locs in projects:
+                n = len(locs)
+                project_item = QTreeWidgetItem(
+                    [f"{project_name} ({n} location{'s' if n != 1 else ''})"]
+                )
+                project_item.setFlags(
+                    project_item.flags() & ~ITEM_IS_SELECTABLE
+                )
+                gid_item.addChild(project_item)
+
+                for loc in locs:
+                    loc_item = QTreeWidgetItem([loc.name])
+                    loc_item.setData(0, USER_ROLE, loc)
+                    project_item.addChild(loc_item)
+
+                project_item.setExpanded(True)
 
             gid_item.setExpanded(True)
 
