@@ -19,7 +19,5 @@ deprecated=False
 changelog=
     1.6.3
     - Workspace locations are now grouped by Global Identifier and Project, matching the LOC dashboard
-    1.6.2
-    - Categories and their icons now load noticeably faster
-    - Deleting a route stop in QGIS now removes it from LOC on the next push
+    - Easier navigation when working across multiple projects
     - General maintenance and stability improvements
