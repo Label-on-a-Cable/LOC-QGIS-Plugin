@@ -616,6 +616,43 @@ class TestPulledRoundTrip:
         counts = ib.extract_multi_stop_counts(p.data)
         assert eb.validate_payload(payload, counts, True) == []
 
+    def test_records_with_empty_fields_stay_unchanged(self, tmp_path):
+        # Seen on Test FTTH: a single stored with fields {} came back with
+        # "N/A" for every mapped field and got a new updatedAt.
+        def mutate(data):
+            for s in data["singleLOCs"]:
+                s["fields"] = {}
+            data["dualLOCs"][0]["fields"] = {}
+            data["dualLOCs"][0]["LOCDestination"]["destination_fields"] = {}
+        p = pulled_network(tmp_path, mutate)
+        known = eb._SINGLE_KNOWN | eb._DUAL_ORIGIN_KNOWN | eb._DUAL_DEST_KNOWN
+        cat_fields = {cf.name for c in p.cats.values()
+                      for cf in list(c.fields) + list(c.destination_fields)
+                      if cf.name.lower() not in known}
+        for layer in p.layers.values():
+            names = [n for n in layer.fields().names() if n in cat_fields]
+            for f in layer.getFeatures():
+                clear_hidden_coords(layer, f.id(), *names)
+        payload = build_pulled(p)
+        src = {s["loc_id"]: s for s in p.data["singleLOCs"]}
+        assert payload["single_locs"]
+        for s in payload["single_locs"]:
+            a = s["attributes"]
+            assert (a["fields"], a["updatedAt"]) == ({}, src[a["loc_id"]]["updatedAt"])
+        dl, raw = payload["dual_locs"][0], p.data["dualLOCs"][0]
+        assert dl["fields"] == {} and dl["LOCDestination"]["destination_fields"] == {}
+        assert dl["updatedAt"] == raw["updatedAt"]
+
+    def test_merge_sub_fields_blank_rules(self):
+        m = eb._merge_sub_fields
+        assert m({}, {"A": "N/A"}) == {}
+        assert m(None, {"A": "N/A"}) is None
+        assert m({"A": None}, {"A": "N/A"}) == {"A": None}
+        assert m({"A": "N/A"}, {"A": "N/A"}) == {"A": "N/A"}
+        assert m({"A": "x"}, {"A": "N/A"}) == {"A": "N/A"}      # user cleared it
+        assert m(None, {"A": "5", "B": "N/A"}) == {"A": "5"}
+        assert m({"A": "1", "C": "k"}, {"A": "2"}) == {"A": "2", "C": "k"}
+
     def test_dual_route_edits_are_patched_and_bumped(self, tmp_path):
         p = pulled_network(tmp_path)
         cables = p.layers["Fiber Cable (LOC)"]

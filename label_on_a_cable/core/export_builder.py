@@ -1651,13 +1651,7 @@ def _patch_standalone_sloc(
         mapped_only=True,
     )
     if sub_fields:
-        raw_fields = patched.get("fields")
-        if isinstance(raw_fields, dict):
-            merged = dict(raw_fields)
-            merged.update(sub_fields)
-            patched["fields"] = merged
-        else:
-            patched["fields"] = sub_fields
+        patched["fields"] = _merge_sub_fields(patched.get("fields"), sub_fields)
 
     # Patch essential identity fields
     uid_qfield = lm.qgis_field_for("Unique Asset Identifier")
@@ -1774,13 +1768,7 @@ def _patch_dual_loc(
         mapped_only=True,
     )
     if origin_sub:
-        raw_fields = patched.get("fields")
-        if isinstance(raw_fields, dict):
-            merged = dict(raw_fields)
-            merged.update(origin_sub)
-            patched["fields"] = merged
-        else:
-            patched["fields"] = origin_sub
+        patched["fields"] = _merge_sub_fields(patched.get("fields"), origin_sub)
 
     # Patch destination-side fields sub-dict only (same merge strategy).
     cat_dest_fields = category.destination_fields if category else []
@@ -1790,13 +1778,8 @@ def _patch_dual_loc(
         mapped_only=True,
     )
     if dest_sub:
-        raw_dest_fields = loc_dest.get("destination_fields")
-        if isinstance(raw_dest_fields, dict):
-            merged = dict(raw_dest_fields)
-            merged.update(dest_sub)
-            loc_dest["destination_fields"] = merged
-        else:
-            loc_dest["destination_fields"] = dest_sub
+        loc_dest["destination_fields"] = _merge_sub_fields(
+            loc_dest.get("destination_fields"), dest_sub)
 
     # Patch identity fields from current QGIS attributes.  When a field is
     # not mapped (or empty) keep the server's own value before falling
@@ -2158,6 +2141,30 @@ def _numbered_fields(
         sub[sub_key] = val if val else "N/A"
 
     return top, sub
+
+
+_BLANK_FIELD_VALUES = ("", "N/A", "NULL", "None")
+
+
+def _merge_sub_fields(raw_fields, sub_fields: dict):
+    """Merge mapped QGIS values (*sub_fields*) into a raw server fields dict.
+
+    A blank QGIS value ("N/A" placeholder) only replaces a server value
+    that is not blank itself.  A pull leaves fields the server never
+    filled in empty in QGIS, so pushing "N/A" back for them would mark an
+    unedited record as changed.
+    """
+    merged = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+    changed = False
+    for key, val in sub_fields.items():
+        old = merged.get(key)
+        if (str(val) in _BLANK_FIELD_VALUES
+                and (old is None or str(old) in _BLANK_FIELD_VALUES)):
+            continue
+        if old != val:
+            merged[key] = val
+            changed = True
+    return merged if changed or isinstance(raw_fields, dict) else raw_fields
 
 
 # ------------------------------------------------------------------
