@@ -432,11 +432,12 @@ def reconstruct_routes(
         return []
 
     # Build spatial index of all point features.
-    # Key: (rounded_lon, rounded_lat) → list of (layer_id, feat_id, name, cat_id)
+    # Key: (rounded_lon, rounded_lat) →
+    #      list of (layer_id, feat_id, name, cat_id, asset_id)
     # 8 decimal places ≈ 1 mm — avoids collisions between distinct
     # structures that are only millimetres apart in server data.
     pt_index: Dict[
-        Tuple[float, float], List[Tuple[str, int, str, str]]
+        Tuple[float, float], List[Tuple[str, int, str, str, str]]
     ] = {}
 
     for pm in point_mappings:
@@ -448,20 +449,17 @@ def reconstruct_routes(
             or pm.qgis_field_for("Unique Asset Identifier")
             or pm.first_mapped_qgis_field()
         )
+        uid_field = pm.qgis_field_for("Unique Asset Identifier")
         for feat in layer.getFeatures():
             geom = feat.geometry()
             if geom.isEmpty() or geom.isNull():
                 continue
             pt = geom.asPoint()
             key = (round(pt.x(), 8), round(pt.y(), 8))
-            try:
-                name = str(feat[name_field]) if name_field else ""
-                if name == "NULL":
-                    name = ""
-            except Exception:
-                name = ""
+            name = _safe_feat_attr(feat, name_field)
+            asset_id = _safe_feat_attr(feat, uid_field)
             pt_index.setdefault(key, []).append(
-                (layer.id(), feat.id(), name, pm.category_id)
+                (layer.id(), feat.id(), name, pm.category_id, asset_id)
             )
 
     _log(f"reconstruct_routes: {len(line_mappings)} line layer(s), "
@@ -469,6 +467,8 @@ def reconstruct_routes(
          f"{len(pt_index)} unique point locations")
 
     routes: List[Route] = []
+    # (line layer id, feature id) → (line CRS, rounded vertex coordinates)
+    occupied: Dict[Tuple[str, int], tuple] = {}
 
     for lm in line_mappings:
         layer = project.mapLayer(lm.layer_id)
@@ -570,7 +570,8 @@ def reconstruct_routes(
                              for j in range(run)]
                     matches = [
                         _find_point(pt_index, key, prefer_cat=stop_cat_id,
-                                    want_in=(info or {}).get("uid", ""))
+                                    want_in=(info or {}).get("uid", ""),
+                                    want_label=(info or {}).get("name", ""))
                         for info in infos
                     ]
                     if not matches[0]:
@@ -658,6 +659,12 @@ def reconstruct_routes(
                 category_name=lm.category_name,
             )
             routes.append(route)
+            # Every position LOC already has a stop or end for on this
+            # route — the snapping pass must not add structures there.
+            occupied[(layer.id(), feat.id())] = (
+                layer.crs(),
+                {(round(v.x(), 8), round(v.y(), 8)) for v in vertices},
+            )
 
             _log(f"Reconstructed route '{line_name}': "
                  f"{len(stops)} total stops "
@@ -693,6 +700,20 @@ def reconstruct_routes(
         reconstructed_keys.add(key)
         snap_route = snap_by_key.get(key)
         if snap_route:
+            line_crs, taken = occupied.get(key, (None, set()))
+            on_route = {(s.point_layer_id, s.point_feature_id)
+                        for s in route.stops if s.point_feature_id >= 0}
+            # A structure that is not on the route but shares a coordinate
+            # with one of its stops or ends (e.g. a handhole under an
+            # enclosure) is already represented there on the server — it
+            # is not a new stop.  Stops already on the route stay: they
+            # anchor where genuinely new stops are inserted.
+            snap_route.stops = [
+                s for s in snap_route.stops
+                if s.is_endpoint
+                or (s.point_layer_id, s.point_feature_id) in on_route
+                or _point_key(project, s, line_crs) not in taken
+            ]
             merged = _merge_stops(route, snap_route)
             if merged:
                 _log(f"Merged {merged} snap stop(s) into '{route.line_name}'")
@@ -713,6 +734,22 @@ def reconstruct_routes(
              f"via snapping")
 
     return merged_routes
+
+
+def _point_key(project, stop: Stop, crs) -> Optional[Tuple[float, float]]:
+    """Rounded coordinate of a stop's point feature, in *crs*."""
+    layer = project.mapLayer(stop.point_layer_id)
+    if not isinstance(layer, QgsVectorLayer):
+        return None
+    feat = layer.getFeature(stop.point_feature_id)
+    if not feat.isValid() or feat.geometry().isEmpty():
+        return None
+    geom = QgsGeometry(feat.geometry())
+    if crs is not None and layer.crs() != crs:
+        from qgis.core import QgsCoordinateTransform
+        geom.transform(QgsCoordinateTransform(layer.crs(), crs, project))
+    pt = geom.asPoint()
+    return (round(pt.x(), 8), round(pt.y(), 8))
 
 
 def _merge_stops(recon_route: Route, snap_route: Route) -> int:
@@ -804,6 +841,7 @@ def _find_point(
     exclude_cat: str = "",
     want_name: str = "",
     want_in: str = "",
+    want_label: str = "",
 ) -> Optional[Tuple[str, int, str]]:
     """Find a point feature at the given coordinate key.
 
@@ -812,10 +850,12 @@ def _find_point(
     *prefer_cat*: if set, prefer matches from this category.
     *exclude_cat*: if set, exclude matches from this category (with
     fallback to any match if all were excluded).
-    *want_name* / *want_in*: when several structures share the
-    coordinate, pick the one named exactly *want_name*, or whose name
-    appears in *want_in* (a server stop identity such as
-    ``"Route_Handhole 9"``; the longest such name wins).
+    *want_name* / *want_in* / *want_label*: when several structures share
+    the coordinate, pick the one named exactly *want_name*; else the one
+    whose asset id (or, failing that, name) appears in *want_in* — a
+    server stop identity such as ``"OM_DUCT_11_OM_VAULT_38"``; else the
+    one whose name appears in *want_label* (the server stop's name).
+    The longest such id or name wins.
     """
     candidates = pt_index.get(key)
     if not candidates:
@@ -829,26 +869,41 @@ def _find_point(
     if not filtered:
         filtered = list(candidates)  # fallback
 
+    def pick(c):
+        return (c[0], c[1], c[2])
+
+    def asset_id(c):
+        return c[4] if len(c) > 4 else ""
+
+    def longest(cands, attr):
+        cands = sorted(cands, key=lambda c: len(attr(c)), reverse=True)
+        return pick(cands[0]) if cands else None
+
     if want_name:
         named = [c for c in filtered if c[2] == want_name]
         if named:
-            lid, fid, name, _ = named[0]
-            return (lid, fid, name)
+            return pick(named[0])
     if want_in:
-        named = sorted((c for c in filtered if c[2] and c[2] in want_in),
-                       key=lambda c: len(c[2]), reverse=True)
-        if named:
-            lid, fid, name, _ = named[0]
-            return (lid, fid, name)
+        # Server stop ids embed the structure's own asset id
+        # ("OM_DUCT_11_OM_VAULT_38") or, in older data, its name.
+        found = (longest([c for c in filtered if asset_id(c) and asset_id(c) in want_in],
+                         asset_id)
+                 or longest([c for c in filtered if c[2] and c[2] in want_in],
+                            lambda c: c[2]))
+        if found:
+            return found
+    if want_label:
+        found = longest([c for c in filtered if c[2] and c[2] in want_label],
+                        lambda c: c[2])
+        if found:
+            return found
 
     if prefer_cat:
         preferred = [c for c in filtered if c[3] == prefer_cat]
         if preferred:
-            lid, fid, name, _ = preferred[0]
-            return (lid, fid, name)
+            return pick(preferred[0])
 
-    lid, fid, name, _ = filtered[0]
-    return (lid, fid, name)
+    return pick(filtered[0])
 
 
 def _stop_type_from_name(name: str, default: StopType) -> StopType:

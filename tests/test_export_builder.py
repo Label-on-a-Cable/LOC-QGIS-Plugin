@@ -818,6 +818,65 @@ class TestPulledRoundTrip:
             assert [s["singleLoc"]["updatedAt"] for s in stops] == \
                 [s["singleLoc"]["updatedAt"] for s in raw]
 
+    def test_asset_code_stop_ids_round_trip_after_generate(self, tmp_path):
+        """FTTH Project pattern: stop ids embed the structure's asset code
+        ("OM_DUCT_11_OM_VAULT_38") and names carry no route prefix
+        ("Vault 38").  Generate after pull must change nothing."""
+        codes = {"Pole 1 Twin": "P1T", "Handhole X": "HX", "Pole 2": "P2",
+                 "Pole 3": "P3", "Chamber 1": "CH1"}
+
+        def mutate(data):
+            for s in data["multiLoc"][0]["Stops"]:
+                sl = s["singleLoc"]
+                base = sl["unique_asset_id"].replace("CBL-001_", "")
+                name = base.removesuffix("_IN").removesuffix("_OUT")
+                sl["unique_asset_id"] = "CBL-001_" + codes[name] + base[len(name):]
+                sl["actual_asset_name"] = name
+        p = pulled_network(tmp_path, mutate, extra_poles=self.COLOCATED)
+        raw = sorted(p.data["multiLoc"][0]["Stops"], key=lambda s: s["stopNumber"])
+        routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        assert [s.structure_name for s in r.intermediate_stops] == [
+            "Pole 1 Twin", "Pole 2", "Handhole X", "Chamber 1", "Chamber 1", "Pole 3"]
+        stops = build_pulled(p, routes)["multiLocs"][0]["Stops"]
+        keys = ("loc_id", "unique_asset_id", "actual_asset_name", "updatedAt")
+        assert [[s["singleLoc"][k] for k in keys] for s in stops] == \
+            [[s["singleLoc"][k] for k in keys] for s in raw]
+
+    def test_generate_ignores_colocated_structure_that_is_not_a_stop(self, tmp_path):
+        """A structure sharing a stop's position but not on the route in
+        LOC (Handhole 35 under FD Enclosure 26) is not a new stop."""
+        p = pulled_network(tmp_path)
+        poles = p.layers["Pole (LOC)"]
+        p2 = feature_where(poles, "Unique Asset Identifier", "P2")
+        f = QgsFeature(poles.fields())
+        f.setGeometry(QgsGeometry(p2.geometry()))
+        f.setAttribute("Unique Asset Identifier", "HZ")
+        f.setAttribute("Actual Asset Name", "Handhole Z")
+        poles.dataProvider().addFeatures([f])
+        routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        assert "Handhole Z" not in [s.structure_name for s in r.stops]
+        assert r.active_stop_count == 4
+        assert build_pulled(p, routes)["_deleted_loc_ids"] == []
+
+    def test_unmapped_destination_keeps_server_name(self, tmp_path):
+        """OM_DUCT_11 pattern: LOC's destination name differs from the
+        structure at the end point; with Destination unmapped the push
+        must keep LOC's name, not rename it after that structure."""
+        def mutate(data):
+            data["multiLoc"][0]["dualLoc"]["LOCDestination"]["destination"] = "Handhole Q"
+        p = pulled_network(tmp_path, mutate)
+        for m in p.maps:
+            m.field_mappings = [fm for fm in m.field_mappings
+                                if fm.loc_field not in ("Destination", "Actual Asset Name")]
+        routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
+        dl = build_pulled(p, routes)["multiLocs"][0]["dualLoc"]
+        raw = p.data["multiLoc"][0]["dualLoc"]
+        assert dl["LOCDestination"]["destination"] == "Handhole Q"
+        assert dl["actual_asset_name"] == raw["actual_asset_name"]
+        assert dl["updatedAt"] == raw["updatedAt"]
+
     def test_renamed_pulled_stop_pushes_new_name(self, tmp_path):
         p = pulled_network(tmp_path)
         routes = ib.reconstruct_routes(p.maps, skip_snapping=True)

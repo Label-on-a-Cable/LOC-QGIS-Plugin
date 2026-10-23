@@ -1798,13 +1798,17 @@ def _patch_dual_loc(
         else:
             loc_dest["destination_fields"] = dest_sub
 
-    # Patch identity fields from current QGIS attributes
+    # Patch identity fields from current QGIS attributes.  When a field is
+    # not mapped (or empty) keep the server's own value before falling
+    # back to names derived from the route geometry — on real data the
+    # structure at a route end does not always carry the name LOC uses.
+    raw_dest = raw.get("LOCDestination") if isinstance(raw.get("LOCDestination"), dict) else {}
     route_id_qfield = mapping.qgis_field_for("Route ID")
     unique_asset_id = ""
     if route_id_qfield and line_feature is not None:
         unique_asset_id = _safe_value(line_feature, route_id_qfield)
     if not unique_asset_id:
-        unique_asset_id = route.line_name
+        unique_asset_id = raw.get("unique_asset_id") or route.line_name
     patched["unique_asset_id"] = unique_asset_id
 
     aan_qfield = mapping.qgis_field_for("Actual Asset Name")
@@ -1812,7 +1816,7 @@ def _patch_dual_loc(
     if aan_qfield and line_feature is not None:
         actual_asset_name = _safe_value(line_feature, aan_qfield)
     if not actual_asset_name:
-        actual_asset_name = route.origin
+        actual_asset_name = raw.get("actual_asset_name") or route.origin
     patched["actual_asset_name"] = actual_asset_name
 
     dest_qfield = mapping.qgis_field_for("Destination")
@@ -1820,7 +1824,7 @@ def _patch_dual_loc(
     if dest_qfield and line_feature is not None:
         destination = _safe_value(line_feature, dest_qfield)
     if not destination:
-        destination = route.destination
+        destination = raw_dest.get("destination") or route.destination
     # Patch both the top-level and nested destination name
     if isinstance(patched["LOCDestination"], dict):
         patched["LOCDestination"]["destination"] = destination
