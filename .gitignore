@@ -8,6 +8,11 @@
 !label_on_a_cable/
 !label_on_a_cable/**
 
+# Include the test suite (but not its generated reports)
+!tests/
+!tests/**
+tests/reports/
+
 # Exclude generated/temporary files within the plugin
 __pycache__/
 *.pyc
