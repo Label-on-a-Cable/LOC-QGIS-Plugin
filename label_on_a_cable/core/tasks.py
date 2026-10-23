@@ -15,7 +15,9 @@ from ..models.route import Route
 from .route_generator import DEFAULT_SNAP_TOLERANCE
 from ..qt_compat import TASK_CAN_CANCEL
 from ..services.api_client import ApiClient
-from ..services.exceptions import AuthenticationException, LOCAPIException
+from ..services.exceptions import (
+    AuthenticationException, LOCAPIException, NetworkException,
+)
 
 # Express's default JSON body limit; a payload above it is refused before
 # the route handler runs unless the server raises the limit explicitly.
@@ -149,6 +151,8 @@ class PushPreviewTask(QgsTask):
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
         self.payload_bytes: int = 0
+        # True when no HTTP response arrived (timeout / connection error)
+        self.network_error: bool = False
 
     def run(self):
         try:
@@ -167,6 +171,7 @@ class PushPreviewTask(QgsTask):
             )
         except LOCAPIException as exc:
             self.error = str(exc)
+            self.network_error = isinstance(exc, NetworkException)
             self.status_code = getattr(exc, "status_code", None)
             self.request_id = getattr(exc, "request_id", "")
             self.elapsed_seconds = getattr(exc, "elapsed_seconds", 0.0)
@@ -191,6 +196,8 @@ class PushTask(QgsTask):
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
         self.payload_bytes: int = 0
+        # True when no HTTP response arrived (timeout / connection error)
+        self.network_error: bool = False
 
     def run(self):
         try:
@@ -203,6 +210,7 @@ class PushTask(QgsTask):
                 self.message = "Push complete."
         except LOCAPIException as exc:
             self.error = str(exc)
+            self.network_error = isinstance(exc, NetworkException)
             self.status_code = getattr(exc, "status_code", None)
             self.request_id = getattr(exc, "request_id", "")
             self.elapsed_seconds = getattr(exc, "elapsed_seconds", 0.0)

@@ -191,7 +191,7 @@ class ApiClient:
             ) from exc
         except requests.Timeout as exc:
             _log.error(
-                "Request timed out: URL=%s  timeout=%ds", url, timeout,
+                "Request timed out: URL=%s  timeout=%ss", url, timeout,
             )
             raise NetworkException(
                 f"Request timed out after {timeout}s: {url}",

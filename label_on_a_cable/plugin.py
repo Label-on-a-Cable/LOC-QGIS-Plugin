@@ -356,6 +356,9 @@ class LabelOnACablePlugin:
     def _on_mapping_accepted(self, mappings, snap_tolerance):
         """Called when the user confirms category mappings."""
         self.layer_mappings = mappings
+        # Saved LOC IDs are keyed by each layer's asset id field
+        from .core.export_builder import set_layer_mappings
+        set_layer_mappings(mappings)
         # Clear pull state — new/changed mappings mean the user is working
         # with different layers (possibly a different project).
         self._pulled_loc_ids = set()
@@ -760,11 +763,10 @@ class LabelOnACablePlugin:
             # message or "Operation timeout") but still commits the data.
             # Only treat as hard failure when we never got a response
             # (client-side timeout / connection error) or the status
-            # indicates a proxy/gateway issue (502-504).
-            err_lower = task.error.lower()
+            # indicates a proxy/gateway issue (502-504).  Decided by the
+            # error type, not its wording ("timed out" vs "timeout").
             is_hard_failure = (
-                ("timeout" in err_lower and not task.status_code)
-                or "connection" in err_lower
+                getattr(task, "network_error", False)
                 or task.status_code in (502, 503, 504)
             )
 
@@ -857,6 +859,8 @@ class LabelOnACablePlugin:
         self.layer_mappings = mappings
         self._pulled_loc_ids = pulled_ids
         self._pulled_multi_stop_counts = multi_stop_counts or {}
+        from .core.export_builder import set_layer_mappings
+        set_layer_mappings(mappings)
 
         # Auto-reconstruct routes from pulled layer geometry so the user
         # can review/push without running the snapping-based generator

@@ -121,8 +121,9 @@ def build_payload(
     _active_location_id = location.location_id
     _current_stamp_layer = None
 
-    # Re-key stamp cache entries if layer source strings changed
-    # (e.g. after route regeneration, or a pull into memory layers).
+    # Saved IDs are keyed by asset id; refresh which field identifies each
+    # layer's assets, then upgrade any old layer_source:fid entries.
+    set_layer_mappings(layer_mappings)
     _migrate_stamps(routes, layer_mappings, location.location_id)
 
     mapping_by_layer: Dict[str, LayerMapping] = {
@@ -198,7 +199,8 @@ def build_payload(
         )
 
         fmap_entry = {"layer_id": route.line_layer_id,
-                      "feature_id": route.line_feature_id}
+                      "feature_id": route.line_feature_id,
+                      "route_name": route.line_name}
         if not intermediates:
             # 0 stops → standalone dual_loc
             # Always include — server deletes LOCs not in the push.
@@ -493,6 +495,10 @@ def stamp_ids_after_push(payload: dict) -> int:
             entry["_origin_id"] = dloc.get("origin_id", "")
             entry["_dest_id"] = dest.get("destination_id", "")
             entry["_unique_asset_id"] = dloc.get("unique_asset_id", "")
+            # Lets _migrate_route_stamps re-key this route when its layer
+            # source changes (pull, re-created layer), like multi routes.
+            entry["_route_name"] = (fm.get("route_name")
+                                    or dloc.get("unique_asset_id", ""))
             entry["_createdAt"] = dloc.get("createdAt", "")
             entry["_updatedAt"] = dloc.get("updatedAt", "")
             entry["_dest_createdAt"] = dest.get("createdAt", "")
@@ -557,6 +563,7 @@ def sync_stamps_from_server(
 
     global _active_location_id
     _active_location_id = location_id
+    set_layer_mappings(layer_mappings)
 
     cache = _load_stamp_cache()
     loc_stamps = cache.setdefault(location_id, {})
@@ -722,9 +729,61 @@ def sync_stamps_from_server(
 # Stamp cache — sidecar JSON stored next to the QGIS project file
 # (e.g. MyProject.qgz → MyProject_loc_stamps.json)
 #
-# Structure:  { location_id: { "layer_source:fid": { field: value } } }
+# Structure:  { location_id: { key: { field: value } } }
 # Scoped by location_id so stamps from Location A don't leak into Location B.
+#
+# Keys identify the *asset*, not the QGIS feature:
+#     "asset|<category_id>|<asset id>"
+# where the asset id is the feature's mapped Route ID (lines) or Unique
+# Asset Identifier / Actual Asset Name (points).  This survives re-created
+# and pulled layers and Shapefile FID renumbering, which the old
+# "layer_source:fid" keys did not.  Features with no asset id, or one that
+# several features share, keep a "layer_source:fid" key so two features
+# can never share one LOC record.  Old-format entries are upgraded by
+# _migrate_stamps on the next push.
 # ---------------------------------------------------------------------------
+
+_ASSET_KEY_PREFIX = "asset|"
+
+# layer_id → (category_id, candidate identity fields), set from mappings
+_layer_identity: Dict[str, Tuple[str, List[str]]] = {}
+_ambiguous_asset_keys: set = set()
+_key_memo: Dict[Tuple[str, int], str] = {}
+
+
+def set_layer_mappings(layer_mappings: List[LayerMapping]) -> None:
+    """Tell the stamp cache which field identifies each mapped layer's assets.
+
+    Called whenever mappings change (mapping dialog, pull) and at the start
+    of every push/sync.  Asset ids used by more than one feature of a
+    category are recorded as ambiguous and fall back to per-feature keys.
+    """
+    _layer_identity.clear()
+    _ambiguous_asset_keys.clear()
+    _key_memo.clear()
+    project = QgsProject.instance()
+    seen: Dict[str, int] = {}
+    for lm in layer_mappings:
+        if not lm.category_id:
+            continue
+        layer = project.mapLayer(lm.layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+        if layer.geometryType() == GEOM_LINE:
+            fields = [lm.qgis_field_for("Route ID")]
+        else:
+            fields = [lm.qgis_field_for("Unique Asset Identifier"),
+                      lm.qgis_field_for("Actual Asset Name")]
+        fields.append(lm.first_mapped_qgis_field())
+        fields = [f for f in dict.fromkeys(fields) if f]
+        if not fields:
+            continue
+        _layer_identity[lm.layer_id] = (lm.category_id, fields)
+        for feat in layer.getFeatures():
+            key = _asset_key_for(layer, feat)
+            if key:
+                seen[key] = seen.get(key, 0) + 1
+    _ambiguous_asset_keys.update(k for k, n in seen.items() if n > 1)
 
 _stamp_cache: Optional[Dict[str, dict]] = None  # full file contents
 _stamp_cache_path: Optional[_pathlib.Path] = None  # resolved per-project
@@ -736,23 +795,60 @@ def _get_stamp_cache_path() -> Optional[_pathlib.Path]:
 
     Returns None if the project hasn't been saved yet.
     """
-    global _stamp_cache_path
+    global _stamp_cache_path, _stamp_cache
     project_path = QgsProject.instance().absoluteFilePath()
     if not project_path:
+        if _stamp_cache_path is not None:
+            # Switched to an unsaved project — drop the previous
+            # project's stamps rather than serving them here.
+            _stamp_cache = None
+            _stamp_cache_path = None
         return None
     p = _pathlib.Path(project_path)
     new_path = p.parent / f"{p.stem}_loc_stamps.json"
     if _stamp_cache_path != new_path:
         # Project changed — invalidate in-memory cache
-        global _stamp_cache
         _stamp_cache = None
         _stamp_cache_path = new_path
     return new_path
 
 
+def _asset_key_for(layer: QgsVectorLayer, feat: QgsFeature) -> str:
+    """``asset|<category>|<asset id>`` for a feature, or '' if it has none."""
+    ident = _layer_identity.get(layer.id())
+    if not ident:
+        return ""
+    category_id, fields = ident
+    for field_name in fields:
+        try:
+            val = feat.attribute(field_name)
+        except (KeyError, RuntimeError):
+            continue
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text and text != "NULL":
+            return f"{_ASSET_KEY_PREFIX}{category_id}|{text}"
+    return ""
+
+
 def _stamp_cache_key(layer: QgsVectorLayer, fid: int) -> str:
-    """Build a stable cache key from the layer's data source and feature ID."""
-    return f"{layer.source()}:{fid}"
+    """Cache key for a feature: its asset key where it has a unique asset
+    id, otherwise the per-feature ``layer_source:fid`` key."""
+    memo = (layer.id(), fid)
+    if memo in _key_memo:
+        return _key_memo[memo]
+    key = ""
+    if layer.id() in _layer_identity:
+        feat = layer.getFeature(fid)
+        if feat.isValid():
+            key = _asset_key_for(layer, feat)
+            if key in _ambiguous_asset_keys:
+                key = ""
+    if not key:
+        key = f"{layer.source()}:{fid}"
+    _key_memo[memo] = key
+    return key
 
 
 def _migrate_stamps(
@@ -760,148 +856,74 @@ def _migrate_stamps(
     layer_mappings: List[LayerMapping],
     location_id: str,
 ) -> int:
-    """Re-key stamp cache entries whose layer source string changed.
+    """Upgrade old ``layer_source:fid`` entries to asset keys.
 
-    The primary cache key is ``layer.source():fid``, so anything that
-    changes a layer's source string orphans its entries — route
-    regeneration and Pull both do, since memory layers carry a generated
-    uid in that string.  Route entries are recovered via ``_route_name``;
-    everything else via ``_unique_asset_id``.
-
-    Returns the total number of entries migrated.
+    Each old entry is matched to a current feature — by its layer and
+    feature id when that layer is still in the project, otherwise by the
+    asset id the entry recorded (``_unique_asset_id`` / ``_route_name``),
+    within one category only — and moved to that feature's asset key.
+    Entries that match nothing, or more than one feature, stay as they
+    are.  Returns the number of entries upgraded.
     """
     cache = _load_stamp_cache()
     loc_stamps = cache.get(location_id)
     if not loc_stamps:
         return 0
 
-    project = QgsProject.instance()
-    migrated = _migrate_route_stamps(project, loc_stamps, routes)
-    migrated += _migrate_asset_stamps(project, loc_stamps, layer_mappings)
+    legacy = [k for k in loc_stamps if not k.startswith(_ASSET_KEY_PREFIX)]
+    if not legacy:
+        return 0
 
-    if migrated:
+    project = QgsProject.instance()
+    layers_by_source: Dict[str, QgsVectorLayer] = {}
+    by_asset_id: Dict[str, List[str]] = {}   # raw asset id → asset keys
+    for layer_id in _layer_identity:
+        layer = project.mapLayer(layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+        layers_by_source[layer.source()] = layer
+        for feat in layer.getFeatures():
+            key = _asset_key_for(layer, feat)
+            if key and key not in _ambiguous_asset_keys:
+                by_asset_id.setdefault(key.split("|", 2)[2], []).append(key)
+
+    upgraded = 0
+    for old_key in legacy:
+        entry = loc_stamps[old_key]
+        new_key = ""
+        source, _, fid_text = old_key.rpartition(":")
+        layer = layers_by_source.get(source)
+        if layer is not None and fid_text.lstrip("-").isdigit():
+            candidate = _stamp_cache_key(layer, int(fid_text))
+            if candidate.startswith(_ASSET_KEY_PREFIX):
+                new_key = candidate
+        if not new_key:
+            asset_id = entry.get("_unique_asset_id") or entry.get("_route_name") or ""
+            matches = by_asset_id.get(asset_id, [])
+            if len(matches) == 1:
+                new_key = matches[0]
+        if new_key and new_key not in loc_stamps:
+            loc_stamps[new_key] = entry
+            del loc_stamps[old_key]
+            upgraded += 1
+
+    if upgraded:
         _save_stamp_cache(cache)
         QgsMessageLog.logMessage(
-            f"Migrated {migrated} stamp cache entries to current layers",
+            f"Upgraded {upgraded} saved LOC ID entries to asset keys",
             "LOC Export", Qgis.MessageLevel.Info,
         )
-    return migrated
-
-
-def _migrate_route_stamps(
-    project: QgsProject,
-    loc_stamps: Dict[str, dict],
-    routes: List["Route"],
-) -> int:
-    """Re-key route (multi/dual line) entries by ``_route_name``."""
-    # Build reverse index: route_name → (old_key, entry)
-    by_route_name: Dict[str, tuple] = {}
-    for old_key, entry in loc_stamps.items():
-        rname = entry.get("_route_name", "")
-        if rname:
-            by_route_name[rname] = (old_key, entry)
-
-    if not by_route_name:
-        return 0
-
-    migrated = 0
-    for route in routes:
-        layer = project.mapLayer(route.line_layer_id)
-        if not isinstance(layer, QgsVectorLayer):
-            continue
-        new_key = _stamp_cache_key(layer, route.line_feature_id)
-
-        # Check if the existing entry (if any) belongs to THIS route.
-        # After Shapefile FID renumbering, FID N may now point to a
-        # different route's cache entry.
-        existing = loc_stamps.get(new_key, {})
-        if existing.get("_route_name") == route.line_name:
-            continue  # Correctly linked — no migration needed
-
-        old_entry = by_route_name.get(route.line_name)
-        if old_entry is None:
-            continue
-        _, entry = old_entry
-        loc_stamps[new_key] = entry
-        migrated += 1
-
-    return migrated
-
-
-def _migrate_asset_stamps(
-    project: QgsProject,
-    loc_stamps: Dict[str, dict],
-    layer_mappings: List[LayerMapping],
-) -> int:
-    """Re-key standalone asset entries by ``_unique_asset_id``.
-
-    Single-LOC entries never carry a ``_route_name``, so
-    ``_migrate_route_stamps`` cannot recover them: on a pull-then-push
-    cycle every standalone asset orphans and re-pushes as a create.
-    Matching is on the identity the server itself matches on — the
-    feature's mapped Unique Asset Identifier.
-
-    Entries written before ``_unique_asset_id`` was stamped have nothing
-    to match against and are skipped; the next successful push adds the
-    field, so the cache self-heals.
-    """
-    by_uid: Dict[str, dict] = {}
-    for entry in loc_stamps.values():
-        # Routes are handled by _migrate_route_stamps — leaving them out
-        # keeps the two passes from fighting over the same key.
-        if entry.get("_route_name"):
-            continue
-        uid = entry.get("_unique_asset_id", "")
-        if uid:
-            by_uid[uid] = entry
-
-    if not by_uid:
-        return 0
-
-    migrated = 0
-    for lm in layer_mappings:
-        if not lm.category_id:
-            continue
-        layer = project.mapLayer(lm.layer_id)
-        if not isinstance(layer, QgsVectorLayer):
-            continue
-        if layer.geometryType() == GEOM_LINE:
-            continue  # route layers: handled by _migrate_route_stamps
-
-        uid_qfield = lm.qgis_field_for("Unique Asset Identifier")
-        if not uid_qfield:
-            continue
-
-        for feat in layer.getFeatures():
-            if not feat.isValid():
-                continue
-            try:
-                feat_uid = feat.attribute(uid_qfield)
-            except (KeyError, RuntimeError):
-                continue
-            if not feat_uid or str(feat_uid) == "NULL":
-                continue
-            entry = by_uid.get(str(feat_uid).strip())
-            if entry is None:
-                continue
-
-            new_key = _stamp_cache_key(layer, feat.id())
-            # After a FID renumber, new_key may already hold a *different*
-            # asset's entry — same guard as the route pass.
-            if loc_stamps.get(new_key) is entry:
-                continue
-            loc_stamps[new_key] = entry
-            migrated += 1
-
-    return migrated
+    return upgraded
 
 
 def _load_stamp_cache() -> Dict[str, dict]:
     """Load the full stamp cache from disk (or return the in-memory copy)."""
     global _stamp_cache
+    # Resolve the path first: it drops the in-memory copy when another
+    # project has been opened since it was loaded.
+    path = _get_stamp_cache_path()
     if _stamp_cache is not None:
         return _stamp_cache
-    path = _get_stamp_cache_path()
     if path is not None and path.exists():
         try:
             _stamp_cache = _json.loads(path.read_text("utf-8"))
@@ -917,8 +939,10 @@ def _load_stamp_cache() -> Dict[str, dict]:
 def _save_stamp_cache(cache: Dict[str, dict]) -> None:
     """Persist the stamp cache to disk next to the project file."""
     global _stamp_cache
-    _stamp_cache = cache
+    # Resolve the path before keeping *cache*: resolving can reset the
+    # in-memory copy, which used to discard the cache just assigned.
     path = _get_stamp_cache_path()
+    _stamp_cache = cache
     if path is None:
         QgsMessageLog.logMessage(
             "Cannot save stamp cache: QGIS project not saved yet. "
@@ -1909,8 +1933,14 @@ def _rebuild_stops_from_raw(
     # reconstruction preserved the exact same stops in the same order.
     can_seq_fallback = len(intermediates) == len(sorted_orig)
 
-    stops_arr: List[dict] = []
-    for idx, stop in enumerate(intermediates, start=1):
+    # Pass 1: match every stop by coordinate.  Pass 2 (below) may then
+    # fall back to position, but only onto an original entry that no
+    # coordinate match has claimed — otherwise a newly added stop could
+    # inherit an existing stop's loc_id when one stop was removed and
+    # another added (equal counts), giving two stops one record.
+    resolved = []  # (stop, pt_feature, pt_xy, matched_entry or None)
+    claimed: set = set()
+    for stop in intermediates:
         pt_feature = _get_feature(
             project, stop.point_layer_id, stop.point_feature_id,
         )
@@ -1918,20 +1948,47 @@ def _rebuild_stops_from_raw(
             pt_feature, stop.point_layer_id, transforms,
         )
         coord_key = (round(pt_xy[0], 8), round(pt_xy[1], 8))
-
-        # Try to match to an original stop by coordinate
         orig_list = orig_by_coord.get(coord_key)
-        matched_entry = None
+        matched_entry = orig_list.pop(0) if orig_list else None
+        if matched_entry is not None:
+            claimed.add(id(matched_entry))
+        resolved.append((stop, pt_feature, pt_xy, matched_entry))
 
-        if orig_list:
-            matched_entry = orig_list.pop(0)
-        elif can_seq_fallback and idx - 1 < len(sorted_orig):
+    # stop_ids already carried by matched entries; a stop built from
+    # scratch must never reuse one of them.
+    used_stop_ids = {
+        e.get("stop_id") for *_, e in resolved if e is not None
+    }
+
+    def _entry_loc_id(entry):
+        sl = (entry.get("singleLoc") or entry.get("singleLOC")
+              or entry.get("single_loc") or {})
+        return sl.get("loc_id", "")
+
+    # Same rule for loc_ids: the coordinate-keyed ID map used for new
+    # stops can point at a record a matched stop already carries (two
+    # structures at one coordinate).
+    used_loc_ids = {
+        _entry_loc_id(e) for *_, e in resolved if e is not None
+    }
+
+    stops_arr: List[dict] = []
+    for idx, (stop, pt_feature, pt_xy, matched_entry) in enumerate(
+        resolved, start=1,
+    ):
+        coord_key = (round(pt_xy[0], 8), round(pt_xy[1], 8))
+        if (matched_entry is None and can_seq_fallback
+                and idx - 1 < len(sorted_orig)
+                and id(sorted_orig[idx - 1]) not in claimed):
             # Sequential fallback: standalone singleLOC coordinates
             # can differ from stop singleLoc coordinates on the server.
             # When stop counts match, reconstruction preserved order
             # from line vertices, so the Nth intermediate is the Nth
             # original stop.
             matched_entry = sorted_orig[idx - 1]
+            claimed.add(id(matched_entry))
+            used_stop_ids.add(matched_entry.get("stop_id"))
+            used_loc_ids.add(_entry_loc_id(matched_entry))
             QgsMessageLog.logMessage(
                 f"Stop {idx} of '{route.line_name}': coord mismatch, "
                 f"using sequential fallback (pt={coord_key})",
@@ -1958,22 +2015,26 @@ def _rebuild_stops_from_raw(
                 patched_sloc["origin_longitude"] = pt_xy[0]
                 patched_sloc["origin_latitude"] = pt_xy[1]
 
-            # Patch identity fields from the reviewed label / point feature
-            pt_mapping = mapping_by_layer.get(stop.point_layer_id)
-            new_base_uid, actual_name = _stop_identity(
-                stop, pt_feature, pt_mapping, route_uid,
-            )
-            # Preserve original unique_asset_id if the base matches — the
-            # server may have added a disambiguation suffix (e.g. "_3") for
-            # egress stops in IN/OUT pairs. The server needs the suffix
-            # to correctly match and delete stops.
+            # Identity: a stop the user has not renamed keeps the server's
+            # unique_asset_id and name exactly — an unedited pull → push
+            # must not rewrite them (LOC counts each as an update).
             orig_uid = orig_sloc.get("unique_asset_id", "")
-            if orig_uid and orig_uid.startswith(new_base_uid):
-                patched_sloc["unique_asset_id"] = orig_uid
-            else:
-                patched_sloc["unique_asset_id"] = new_base_uid
-
-            patched_sloc["actual_asset_name"] = actual_name
+            renamed = stop.display_name != stop.original_name
+            if renamed or not (orig_uid and orig_sloc.get("actual_asset_name")):
+                # Patch identity fields from the reviewed label / point feature
+                pt_mapping = mapping_by_layer.get(stop.point_layer_id)
+                new_base_uid, actual_name = _stop_identity(
+                    stop, pt_feature, pt_mapping, route_uid,
+                )
+                # Preserve original unique_asset_id if the base matches — the
+                # server may have added a disambiguation suffix (e.g. "_3") for
+                # egress stops in IN/OUT pairs. The server needs the suffix
+                # to correctly match and delete stops.
+                if orig_uid and orig_uid.startswith(new_base_uid):
+                    patched_sloc["unique_asset_id"] = orig_uid
+                else:
+                    patched_sloc["unique_asset_id"] = new_base_uid
+                patched_sloc["actual_asset_name"] = actual_name
             patched_sloc["location_id"] = location.location_id
 
             # If stopNumber changed, bump updatedAt and patch name
@@ -2000,12 +2061,24 @@ def _rebuild_stops_from_raw(
                 location.location_id, user_id, now,
                 stop_id_map=stop_id_map,
             )
-            # Prefer coord-matched stop_id, then positional fallback
+            if single_loc["loc_id"] in used_loc_ids:
+                # The ID map handed out a record another stop already
+                # carries: this is a genuinely new stop, give it new IDs.
+                single_loc["loc_id"] = str(uuid4())
+                single_loc["origin_id"] = str(uuid4())
+                single_loc["createdAt"] = single_loc["updatedAt"] = now
+                single_loc.pop("_matched_stop_id", None)
+            used_loc_ids.add(single_loc["loc_id"])
+            # Prefer coord-matched stop_id, then positional fallback —
+            # but never one another stop in this route already carries.
             sid = single_loc.pop("_matched_stop_id", "")
-            if not sid:
+            if not sid or sid in used_stop_ids:
                 sid = (orig_stop_ids[idx - 1]
                        if idx - 1 < len(orig_stop_ids)
-                       else str(uuid4()))
+                       else "")
+            if not sid or sid in used_stop_ids:
+                sid = str(uuid4())
+            used_stop_ids.add(sid)
             stops_arr.append({
                 "stop_id": sid or str(uuid4()),
                 "stopNumber": idx,
@@ -2175,27 +2248,12 @@ def _line_endpoints_wgs84(
     if line_feature is None:
         return zero, zero
 
-    # Try stored original coordinates first
-    origin_xy = zero
-    dest_xy = zero
-    o_lon = _safe_value(line_feature, "_origin_lon")
-    o_lat = _safe_value(line_feature, "_origin_lat")
-    d_lon = _safe_value(line_feature, "_dest_lon")
-    d_lat = _safe_value(line_feature, "_dest_lat")
-    try:
-        if o_lon and o_lat:
-            origin_xy = (float(o_lon), float(o_lat))
-        if d_lon and d_lat:
-            dest_xy = (float(d_lon), float(d_lat))
-    except ValueError:
-        pass
-    if origin_xy != zero and dest_xy != zero:
-        return origin_xy, dest_xy
+    stored_o = _stored_xy(line_feature, "_origin_lon", "_origin_lat")
+    stored_d = _stored_xy(line_feature, "_dest_lon", "_dest_lat")
 
-    # Fallback to geometry
     geom = QgsGeometry(line_feature.geometry())
     if geom.isEmpty() or geom.isNull():
-        return origin_xy or zero, dest_xy or zero
+        return stored_o or zero, stored_d or zero
 
     xform = transforms.get(layer_id)
     if xform is not None:
@@ -2204,22 +2262,19 @@ def _line_endpoints_wgs84(
     if geom.isMultipart():
         parts = geom.asMultiPolyline()
         if not parts or not parts[0]:
-            return origin_xy or zero, dest_xy or zero
+            return stored_o or zero, stored_d or zero
         first = parts[0][0]
         last = parts[-1][-1]
     else:
         pts = geom.asPolyline()
         if not pts:
-            return origin_xy or zero, dest_xy or zero
+            return stored_o or zero, stored_d or zero
         first = pts[0]
         last = pts[-1]
 
-    if origin_xy == zero:
-        origin_xy = (first.x(), first.y())
-    if dest_xy == zero:
-        dest_xy = (last.x(), last.y())
-
-    return origin_xy, dest_xy
+    # Stored strings win only while the line ends have not been moved.
+    return (_prefer_stored(stored_o, (first.x(), first.y())),
+            _prefer_stored(stored_d, (last.x(), last.y())))
 
 
 def _point_wgs84(
@@ -2237,25 +2292,47 @@ def _point_wgs84(
     if pt_feature is None:
         return (0.0, 0.0)
 
-    # Try stored original coordinates first (avoids precision drift)
-    stored_lon = _safe_value(pt_feature, "_origin_lon")
-    stored_lat = _safe_value(pt_feature, "_origin_lat")
-    if stored_lon and stored_lat:
-        try:
-            return (float(stored_lon), float(stored_lat))
-        except ValueError:
-            pass
+    stored = _stored_xy(pt_feature, "_origin_lon", "_origin_lat")
 
     geom = QgsGeometry(pt_feature.geometry())
     if geom.isEmpty() or geom.isNull():
-        return (0.0, 0.0)
+        return stored or (0.0, 0.0)
 
     xform = transforms.get(layer_id)
     if xform is not None:
         geom.transform(xform)
 
     pt = geom.asPoint()
-    return (pt.x(), pt.y())
+    # Stored strings only stand in for the geometry while the point has
+    # not been moved; a moved point must push its new position.
+    return _prefer_stored(stored, (pt.x(), pt.y()))
+
+
+# Stored pull-time coordinates are reused (bit-exact round trip) only
+# while they agree with the feature geometry to within ~1 cm.
+_STORED_COORD_TOLERANCE_DEG = 1e-7
+
+
+def _stored_xy(feature, lon_field, lat_field) -> Optional[Tuple[float, float]]:
+    lon = _safe_value(feature, lon_field)
+    lat = _safe_value(feature, lat_field)
+    if not (lon and lat):
+        return None
+    try:
+        return (float(lon), float(lat))
+    except ValueError:
+        return None
+
+
+def _prefer_stored(
+    stored: Optional[Tuple[float, float]],
+    actual: Tuple[float, float],
+) -> Tuple[float, float]:
+    if (stored is not None
+            and abs(stored[0] - actual[0]) <= _STORED_COORD_TOLERANCE_DEG
+            and abs(stored[1] - actual[1]) <= _STORED_COORD_TOLERANCE_DEG):
+        return stored
+    return actual
 
 
 # ------------------------------------------------------------------

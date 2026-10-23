@@ -385,6 +385,13 @@ class RouteReviewDialog(QDialog):
                     from ..core.export_builder import _get_stamp_value
                     stop_ids_raw = _get_stamp_value(
                         layer, route.line_feature_id, "_stop_ids")
+                    if not stop_ids_raw and "_stop_ids" in layer.fields().names():
+                        # Freshly pulled: no sidecar stamps yet, but the
+                        # pulled feature carries the server's stop list.
+                        feat = layer.getFeature(route.line_feature_id)
+                        if feat.isValid():
+                            raw = feat.attribute("_stop_ids")
+                            stop_ids_raw = "" if raw is None else str(raw)
                     if stop_ids_raw:
                         cached_stop_count = len([
                             s for s in stop_ids_raw.split(",")

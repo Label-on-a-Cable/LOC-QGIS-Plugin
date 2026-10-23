@@ -516,9 +516,16 @@ def reconstruct_routes(
 
             stops: List[Stop] = []
 
+            # Server stop identities, aligned with the intermediate
+            # vertices.  Where two structures share a coordinate (an
+            # enclosure inside a handhole, say) they tell us which of the
+            # co-located point features each stop really is.
+            raw_stops = _raw_stop_info(feat, len(vertices) - 2) if multi_id else []
+
             # --- Origin = first vertex ---
             o_key = (round(vertices[0].x(), 8), round(vertices[0].y(), 8))
-            o_match = _find_point(pt_index, o_key, exclude_cat=stop_cat_id)
+            o_match = _find_point(pt_index, o_key, exclude_cat=stop_cat_id,
+                                  want_name=origin_name)
             if o_match:
                 stops.append(Stop(
                     original_name=o_match[2] or origin_name,
@@ -556,64 +563,74 @@ def reconstruct_routes(
                                 round(vertices[v_idx + run].y(), 8)) == key):
                         run += 1
 
-                    s_match = _find_point(
-                        pt_index, key, prefer_cat=stop_cat_id,
-                    )
-                    if not s_match:
+                    # One match per vertex in the run: co-located
+                    # structures are told apart by the server stop names.
+                    infos = [raw_stops[v_idx - 1 + j]
+                             if v_idx - 1 + j < len(raw_stops) else None
+                             for j in range(run)]
+                    matches = [
+                        _find_point(pt_index, key, prefer_cat=stop_cat_id,
+                                    want_in=(info or {}).get("uid", ""))
+                        for info in infos
+                    ]
+                    if not matches[0]:
                         v_idx += run
                         continue  # no matching structure — skip
 
-                    s_name = s_match[2]
-                    common = dict(
-                        structure_name=s_name,
-                        point_layer_id=s_match[0],
-                        point_feature_id=s_match[1],
-                    )
+                    # Consecutive vertices on the same structure form one
+                    # group (one stop number): 1 → passthrough;
+                    # 2+ → IN, (_2 …), OUT.  Server can store N stops at
+                    # one location (e.g. an IN/OUT pair for an enclosure
+                    # PLUS a handhole), so the export builder can match
+                    # them 1-to-1 with the raw JSON entries.
+                    groups: list = []
+                    for m, info in zip(matches, infos):
+                        m = m or matches[0]
+                        if groups and groups[-1][0][:2] == m[:2]:
+                            groups[-1][1].append(info)
+                        else:
+                            groups.append([m, [info]])
 
-                    if run >= 2:
-                        # Multiple stops at same coordinate.
-                        # Server can store N stops at one location (e.g.
-                        # IN/OUT pair for an enclosure PLUS a handhole).
-                        # Polyline has N duplicate vertices; create N
-                        # Stop objects so the export builder can match
-                        # them 1-to-1 with the raw JSON entries.
+                    for s_match, group_infos in groups:
+                        s_name = s_match[2]
+                        common = dict(
+                            structure_name=s_name,
+                            point_layer_id=s_match[0],
+                            point_feature_id=s_match[1],
+                        )
                         stop_num += 1
-                        for vi in range(run):
-                            if vi == 0:
-                                stype = StopType.INGRESS
-                                suffix = "_IN"
-                            elif vi == run - 1:
-                                stype = StopType.EGRESS
-                                suffix = "_OUT"
+                        prefix = f"{line_name}_{s_name}" if line_name else s_name
+                        count = len(group_infos)
+                        for vi, info in enumerate(group_infos):
+                            if count == 1:
+                                stype, suffix = StopType.PASSTHROUGH, ""
+                            elif vi == 0:
+                                stype, suffix = StopType.INGRESS, "_IN"
+                            elif vi == count - 1:
+                                stype, suffix = StopType.EGRESS, "_OUT"
                             else:
-                                stype = StopType.PASSTHROUGH
-                                suffix = f"_{vi + 1}"
-                            label = (f"{line_name}_{s_name}{suffix}"
-                                     if line_name else f"{s_name}{suffix}")
+                                stype, suffix = StopType.PASSTHROUGH, f"_{vi + 1}"
+                            label = f"{prefix}{suffix}"
+                            # The server's own stop name and IN/OUT role win:
+                            # an unedited pull → push must not rename stops.
+                            server_name = (info or {}).get("name", "")
+                            if server_name:
+                                label = server_name
+                                stype = _stop_type_from_name(server_name, stype)
                             stops.append(Stop(
                                 original_name=label,
                                 stop_type=stype,
                                 stop_number=stop_num,
                                 **common,
                             ))
-                    else:
-                        # Single passthrough
-                        stop_num += 1
-                        label = (f"{line_name}_{s_name}"
-                                 if line_name else s_name)
-                        stops.append(Stop(
-                            original_name=label,
-                            stop_type=StopType.PASSTHROUGH,
-                            stop_number=stop_num,
-                            **common,
-                        ))
 
                     v_idx += run
 
             # --- Destination = last vertex ---
             d_key = (round(vertices[-1].x(), 8),
                      round(vertices[-1].y(), 8))
-            d_match = _find_point(pt_index, d_key, exclude_cat=stop_cat_id)
+            d_match = _find_point(pt_index, d_key, exclude_cat=stop_cat_id,
+                                  want_name=dest_name)
             if d_match:
                 stops.append(Stop(
                     original_name=d_match[2] or dest_name,
@@ -702,47 +719,82 @@ def _merge_stops(recon_route: Route, snap_route: Route) -> int:
     """Merge snap-discovered intermediate stops into a reconstructed route.
 
     Adds any intermediate stops from *snap_route* that aren't already
-    present in *recon_route* (matched by point_feature_id).  New stops
-    are inserted in the order the snapping generator discovered them
-    (sorted by distance along the line), placed before the destination.
+    present in *recon_route* (matched by point layer + feature id).
+
+    *snap_route* lists its stops in order along the line, so each new
+    stop is inserted right after the last reconstructed stop that
+    precedes it there (after the origin if none does).  Intermediate
+    stops are then renumbered so the sequence follows the line; stops
+    sharing a structure (IN/OUT pairs) keep one shared number.
 
     Returns the number of stops added.
     """
-    # Existing point feature IDs in the reconstructed route
-    existing: set = set()
-    for s in recon_route.stops:
-        if s.point_feature_id >= 0:
-            existing.add((s.point_layer_id, s.point_feature_id))
+    def key(s):
+        return (s.point_layer_id, s.point_feature_id)
 
-    # Collect new intermediate stops from snapping
-    new_stops = [
-        s for s in snap_route.stops
-        if not s.is_endpoint
-        and s.point_feature_id >= 0
-        and (s.point_layer_id, s.point_feature_id) not in existing
-    ]
+    existing = {key(s) for s in recon_route.stops if s.point_feature_id >= 0}
 
-    if not new_stops:
+    def last_index_of(k):
+        idx = -1
+        for i, s in enumerate(recon_route.stops):
+            if key(s) == k:
+                idx = i
+        return idx
+
+    def first_insert_index():
+        stops = recon_route.stops
+        if stops and stops[0].stop_type == StopType.ORIGIN:
+            return 1
         return 0
 
-    # Renumber: find the highest existing stop_number, continue from there
-    max_num = max((s.stop_number for s in recon_route.stops), default=0)
-    for s in new_stops:
-        max_num += 1
-        s.stop_number = max_num
+    anchor = None   # index in recon_route.stops to insert after
+    added = 0
+    for s in snap_route.stops:
+        if s.point_feature_id < 0:
+            continue
+        if key(s) in existing:
+            idx = last_index_of(key(s))
+            # Never move backwards: co-located structures can appear in
+            # either order in the snap route (e.g. one is our origin).
+            if (recon_route.stops[idx].stop_type != StopType.DESTINATION
+                    and (anchor is None or idx > anchor)):
+                anchor = idx
+            continue
+        if s.is_endpoint:
+            continue
+        pos = (anchor + 1) if anchor is not None else first_insert_index()
+        # Never insert past the destination
+        for i, r in enumerate(recon_route.stops):
+            if r.stop_type == StopType.DESTINATION and pos > i:
+                pos = i
+        recon_route.stops.insert(pos, s)
+        existing.add(key(s))
+        anchor = pos
+        added += 1
 
-    # Insert before the destination (last stop)
-    dest_idx = len(recon_route.stops)
-    for i, s in enumerate(recon_route.stops):
-        if s.stop_type == StopType.DESTINATION:
-            dest_idx = i
-            break
+    if added:
+        _renumber_intermediates(recon_route)
+    return added
 
-    for s in new_stops:
-        recon_route.stops.insert(dest_idx, s)
-        dest_idx += 1
 
-    return len(new_stops)
+def _renumber_intermediates(route: Route) -> None:
+    """Number intermediate stops 1..N along the route; consecutive stops
+    on the same structure (IN/OUT pairs) share a number."""
+    num = 0
+    prev = None
+    for s in route.stops:
+        if s.is_endpoint:
+            prev = None
+            continue
+        same_structure = (
+            prev is not None and s.point_feature_id >= 0
+            and (s.point_layer_id, s.point_feature_id)
+            == (prev.point_layer_id, prev.point_feature_id)
+        )
+        if not same_structure:
+            num += 1
+        s.stop_number = num
+        prev = s
 
 
 def _find_point(
@@ -750,6 +802,8 @@ def _find_point(
     key: Tuple[float, float],
     prefer_cat: str = "",
     exclude_cat: str = "",
+    want_name: str = "",
+    want_in: str = "",
 ) -> Optional[Tuple[str, int, str]]:
     """Find a point feature at the given coordinate key.
 
@@ -758,6 +812,10 @@ def _find_point(
     *prefer_cat*: if set, prefer matches from this category.
     *exclude_cat*: if set, exclude matches from this category (with
     fallback to any match if all were excluded).
+    *want_name* / *want_in*: when several structures share the
+    coordinate, pick the one named exactly *want_name*, or whose name
+    appears in *want_in* (a server stop identity such as
+    ``"Route_Handhole 9"``; the longest such name wins).
     """
     candidates = pt_index.get(key)
     if not candidates:
@@ -771,6 +829,18 @@ def _find_point(
     if not filtered:
         filtered = list(candidates)  # fallback
 
+    if want_name:
+        named = [c for c in filtered if c[2] == want_name]
+        if named:
+            lid, fid, name, _ = named[0]
+            return (lid, fid, name)
+    if want_in:
+        named = sorted((c for c in filtered if c[2] and c[2] in want_in),
+                       key=lambda c: len(c[2]), reverse=True)
+        if named:
+            lid, fid, name, _ = named[0]
+            return (lid, fid, name)
+
     if prefer_cat:
         preferred = [c for c in filtered if c[3] == prefer_cat]
         if preferred:
@@ -779,6 +849,45 @@ def _find_point(
 
     lid, fid, name, _ = filtered[0]
     return (lid, fid, name)
+
+
+def _stop_type_from_name(name: str, default: StopType) -> StopType:
+    if name.endswith("_IN"):
+        return StopType.INGRESS
+    if name.endswith("_OUT"):
+        return StopType.EGRESS
+    if default in (StopType.INGRESS, StopType.EGRESS):
+        return StopType.PASSTHROUGH
+    return default
+
+
+def _raw_stop_info(feat: QgsFeature, n_vertices: int) -> List[dict]:
+    """Server stop identities (``uid``, ``name``) in polyline-vertex order.
+
+    Mirrors ``_sorted_stop_coords`` (sorted by stopNumber, stops without
+    coordinates skipped) so entry *i* belongs to intermediate vertex *i*.
+    ``uid`` (unique_asset_id) says which structure a stop is; ``name``
+    (actual_asset_name) is the label LOC shows.  Returns ``[]`` when the
+    raw JSON is missing or does not line up.
+    """
+    raw = _safe_feat_attr(feat, "_mloc_json")
+    if not raw:
+        return []
+    try:
+        mloc = _json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(mloc, dict):
+        return []
+    uids = []
+    for stop in sorted(mloc.get("Stops", mloc.get("stops", [])),
+                       key=lambda s: s.get("stopNumber", 0)):
+        sloc = (stop.get("singleLoc") or stop.get("singleLOC")
+                or stop.get("single_loc") or {})
+        if _float(sloc.get("origin_longitude", 0)) or _float(sloc.get("origin_latitude", 0)):
+            uids.append({"uid": str(sloc.get("unique_asset_id") or ""),
+                         "name": str(sloc.get("actual_asset_name") or "")})
+    return uids if len(uids) == n_vertices else []
 
 
 def _safe_feat_attr(feat: QgsFeature, field_name: str) -> str:
