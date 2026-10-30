@@ -267,6 +267,59 @@ class TestReconstructRoutes:
         # default tolerance path
         assert len(ib.reconstruct_routes(mappings)) == 3
 
+    def test_pulled_structure_near_line_is_not_a_new_stop(self, tmp_path):
+        """Spencer pattern: a drop's home enclosure lies 0.14 m from the
+        feeder line but was never a stop on it in LOC.  Generate must
+        leave the route as LOC has it — until the structure is moved."""
+        data, _ = server_state_for_network(tmp_path)
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(ITM))
+        m = [m for m in data["multiLoc"] if m["multiName"] == "CBL-001"][0]
+        a, b = [s["singleLoc"] for s in sorted(m["Stops"], key=lambda s: s["stopNumber"])[-2:]]
+        near = dict([s for s in data["singleLOCs"] if s["unique_asset_id"] == "P1"][0],
+                    loc_id="near-1", unique_asset_id="HE-1", actual_asset_name="Home Enclosure 1",
+                    origin_longitude=(float(a["origin_longitude"]) + float(b["origin_longitude"])) / 2,
+                    origin_latitude=(float(a["origin_latitude"]) + float(b["origin_latitude"])) / 2)
+        data["singleLOCs"].append(near)
+        layers, mappings, ids = add_pulled(data)
+
+        def cbl1():
+            return [r for r in ib.reconstruct_routes(mappings, snap_tolerance=1.0)
+                    if r.line_name == "CBL-001"][0]
+
+        r = cbl1()
+        assert "Home Enclosure 1" not in [s.structure_name for s in r.stops]
+        assert r.active_stop_count == 4
+
+        # Moving it (here: onto the next segment) makes it the user's edit.
+        poles = layers["Pole (LOC)"]
+        he = [f for f in poles.getFeatures() if f["Unique Asset Identifier"] == "HE-1"][0]
+        verts = [f for f in layers["Fiber Cable (LOC)"].getFeatures()
+                 if f["Route ID"] == "CBL-001"][0].geometry().asPolyline()
+        moved = QgsPointXY((verts[1].x() + verts[2].x()) / 2, (verts[1].y() + verts[2].y()) / 2)
+        poles.dataProvider().changeGeometryValues({he.id(): QgsGeometry.fromPointXY(moved)})
+        assert "Home Enclosure 1" in [s.structure_name for s in cbl1().stops]
+
+    def test_unmoved_pulled_point_check(self, pulled):
+        layers, *_ = pulled
+        poles = layers["Pole (LOC)"]
+        p1 = [f for f in poles.getFeatures() if f["Unique Asset Identifier"] == "P1"][0]
+        stop = Stop(point_layer_id=poles.id(), point_feature_id=p1.id())
+        project = QgsProject.instance()
+        assert ib._is_unmoved_pulled_point(project, stop)
+        pt = p1.geometry().asPoint()
+        poles.dataProvider().changeGeometryValues(
+            {p1.id(): QgsGeometry.fromPointXY(QgsPointXY(pt.x() + 1e-5, pt.y()))})
+        assert not ib._is_unmoved_pulled_point(project, stop)
+        assert not ib._is_unmoved_pulled_point(project, Stop(point_layer_id="missing"))
+        nf = QgsFeature(poles.fields())                      # drawn in QGIS
+        nf.setGeometry(QgsGeometry.fromPointXY(pt))
+        _, (added,) = poles.dataProvider().addFeatures([nf])
+        assert not ib._is_unmoved_pulled_point(
+            project, Stop(point_layer_id=poles.id(), point_feature_id=added.id()))
+        idx = poles.fields().indexOf("_origin_lon")
+        poles.dataProvider().changeAttributeValues({p1.id(): {idx: "not a number"}})
+        assert not ib._is_unmoved_pulled_point(project, stop)
+
     def test_snapped_stop_inserted_in_line_order(self, pulled):
         layers, mappings, *_ = pulled
         poles, cables = layers["Pole (LOC)"], layers["Fiber Cable (LOC)"]

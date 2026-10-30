@@ -706,13 +706,18 @@ def reconstruct_routes(
             # A structure that is not on the route but shares a coordinate
             # with one of its stops or ends (e.g. a handhole under an
             # enclosure) is already represented there on the server — it
-            # is not a new stop.  Stops already on the route stay: they
-            # anchor where genuinely new stops are inserted.
+            # is not a new stop.  Neither is a pulled structure that still
+            # sits where LOC has it: LOC already decided it is not a stop
+            # on this route, even when it lies within the snap tolerance
+            # (e.g. a drop's home enclosure next to the feeder line).
+            # Stops already on the route stay: they anchor where genuinely
+            # new stops are inserted.
             snap_route.stops = [
                 s for s in snap_route.stops
                 if s.is_endpoint
                 or (s.point_layer_id, s.point_feature_id) in on_route
-                or _point_key(project, s, line_crs) not in taken
+                or (_point_key(project, s, line_crs) not in taken
+                    and not _is_unmoved_pulled_point(project, s))
             ]
             merged = _merge_stops(route, snap_route)
             if merged:
@@ -750,6 +755,42 @@ def _point_key(project, stop: Stop, crs) -> Optional[Tuple[float, float]]:
         geom.transform(QgsCoordinateTransform(layer.crs(), crs, project))
     pt = geom.asPoint()
     return (round(pt.x(), 8), round(pt.y(), 8))
+
+
+_UNMOVED_TOLERANCE_DEG = 1e-7       # ≈ 1 cm; same scale as export's stored coords
+
+
+def _is_unmoved_pulled_point(project, stop: Stop) -> bool:
+    """True when the stop's structure came from a pull and has not moved.
+
+    Pulled point features carry ``_loc_id`` and the server position in
+    ``_origin_lon`` / ``_origin_lat`` (WGS 84).  New structures have no
+    ``_loc_id``; moved ones no longer match their stored position.
+    """
+    layer = project.mapLayer(stop.point_layer_id)
+    if not isinstance(layer, QgsVectorLayer):
+        return False
+    names = layer.fields().names()
+    if not {"_loc_id", "_origin_lon", "_origin_lat"} <= set(names):
+        return False
+    feat = layer.getFeature(stop.point_feature_id)
+    if not feat.isValid() or feat.geometry().isEmpty():
+        return False
+    if not _safe_feat_attr(feat, "_loc_id"):
+        return False
+    try:
+        lon = float(_safe_feat_attr(feat, "_origin_lon"))
+        lat = float(_safe_feat_attr(feat, "_origin_lat"))
+    except (TypeError, ValueError):
+        return False
+    geom = QgsGeometry(feat.geometry())
+    wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+    if layer.crs() != wgs84:
+        from qgis.core import QgsCoordinateTransform
+        geom.transform(QgsCoordinateTransform(layer.crs(), wgs84, project))
+    pt = geom.asPoint()
+    return (abs(pt.x() - lon) <= _UNMOVED_TOLERANCE_DEG
+            and abs(pt.y() - lat) <= _UNMOVED_TOLERANCE_DEG)
 
 
 def _merge_stops(recon_route: Route, snap_route: Route) -> int:
