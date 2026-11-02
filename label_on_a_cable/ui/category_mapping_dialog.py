@@ -37,6 +37,7 @@ from ..core.route_generator import DEFAULT_SNAP_TOLERANCE
 from ..core.tasks import FetchCategoriesTask
 from ..models.category import Category
 from ..models.mapping import (
+    STOP_IDENTITY_FIELDS,
     FieldMapping,
     LayerMapping,
     MappingPreset,
@@ -579,27 +580,13 @@ class _LayerRow:
         if cat is None:
             return
 
-        all_fields = cat.fields
-        # Stop essentials: only Actual Asset Name — Unique Asset Identifier
-        # is always resolved from the point feature automatically.
-        essentials = ["Actual Asset Name"]
-        existing = {cf.name.lower() for cf in all_fields}
-
-        # Inject essential fields if missing from category definition
-        for ename in essentials:
-            if ename.lower() not in existing:
-                self._add_stop_field_combo(
-                    f"<b>{ename}</b> (required):", ename
-                )
-
-        for cf in all_fields:
-            # Skip Unique Asset Identifier — filled automatically
-            if cf.name.lower() == "unique asset identifier":
+        # A stop's Unique Asset Identifier and Actual Asset Name come from
+        # the structure point and the reviewed label, never from the line
+        # feature these combos read, so neither is offered here.
+        for cf in cat.fields:
+            if cf.name.lower() in STOP_IDENTITY_FIELDS:
                 continue
-            label = f"{cf.name}:"
-            if cf.name.lower() in {e.lower() for e in essentials}:
-                label = f"<b>{cf.name}</b> (required):"
-            self._add_stop_field_combo(label, cf.name)
+            self._add_stop_field_combo(f"{cf.name}:", cf.name)
 
     def _add_stop_field_combo(self, label: str, loc_field_name: str):
         """Add one stop field mapping row."""

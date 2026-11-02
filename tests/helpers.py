@@ -165,8 +165,7 @@ def network_mappings(layers):
                 FM("Length", "Length"),
             ],
             stop_category_id=CAT_STOPS, stop_category_name="Stops",
-            stop_field_mappings=[FM("Actual Asset Name", "CableName"),
-                                 FM("Colour", "Colour")],
+            stop_field_mappings=[FM("Colour", "Colour")],
         ),
         LayerMapping(
             layer_id=layers["poles"].id(), layer_name="Poles",

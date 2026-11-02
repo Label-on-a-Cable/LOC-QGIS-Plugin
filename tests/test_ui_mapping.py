@@ -95,11 +95,10 @@ class TestCategoryMappingDialog:
         cable = rows(dlg)["Fiber Cable"]
         pick(cable._cat_combo, CAT_FIBER)
         assert fields(cable) == ["Route ID", "Fiber Count", "Colour", "Destination", "Length"]
-        pick(cable._stop_cat_combo, CAT_POLE)  # UID is resolved automatically
-        assert [n for n, _ in cable._stop_field_combos] == \
-            ["Actual Asset Name", "Height", "Material"]
+        pick(cable._stop_cat_combo, CAT_POLE)  # identity is resolved automatically
+        assert [n for n, _ in cable._stop_field_combos] == ["Height", "Material"]
         pick(cable._stop_cat_combo, CAT_STOPS)
-        assert [n for n, _ in cable._stop_field_combos] == ["Actual Asset Name", "Colour"]
+        assert [n for n, _ in cable._stop_field_combos] == ["Colour"]
         assert cable._stop_cat_combo.findData(CAT_FIBER) == -1  # duals never stops
         cable._stop_cat_combo.setCurrentIndex(0)
         assert cable._stop_field_combos == []
@@ -114,7 +113,7 @@ class TestCategoryMappingDialog:
         pick(poles._cat_combo, "bare-single")
         assert fields(poles) == ["Unique Asset Identifier", "Actual Asset Name"]
         pick(cable._stop_cat_combo, "bare-single")
-        assert [n for n, _ in cable._stop_field_combos] == ["Actual Asset Name"]
+        assert cable._stop_field_combos == []
 
     def test_build_mapping_and_accept(self, qtbot, authed_api, layers):
         dlg = open_dialog(qtbot, authed_api, snap=2.5)
@@ -125,7 +124,7 @@ class TestCategoryMappingDialog:
                            "Colour": "Colour", "Length": "Length"})
         pick(cable._stop_cat_combo, CAT_STOPS)
         for name, combo in cable._stop_field_combos:
-            pick(combo, {"Actual Asset Name": "CableName", "Colour": "Colour"}[name])
+            pick(combo, {"Colour": "Colour"}[name])
         pick(poles._cat_combo, CAT_POLE)
         map_fields(poles, {"Unique Asset Identifier": "PoleID",
                            "Actual Asset Name": "PoleName"})
@@ -147,7 +146,8 @@ class TestCategoryMappingDialog:
         assert c.qgis_field_for("Route ID") == "AssetID"
         assert c.qgis_field_for("Destination") == ""
         assert (c.stop_category_id, c.stop_category_name) == (CAT_STOPS, "Stops")
-        assert c.stop_qgis_field_for("Actual Asset Name") == "CableName"
+        assert c.stop_qgis_field_for("Colour") == "Colour"
+        assert c.stop_qgis_field_for("Actual Asset Name") == ""
         assert c.default_stop_type == "passthrough"
         p = by["Poles"]
         assert p.default_stop_type == "ingress_egress"

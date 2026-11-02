@@ -121,6 +121,9 @@ class TestBuildLayers:
         line = by_name["Fiber Cable (LOC)"]
         assert (line.stop_category_id, line.stop_category_name) == (CAT_STOPS, "Stops")
         assert line.category_id == CAT_FIBER
+        # stop fields map by name onto the line layer; identity is never a stop field
+        assert [(fm.loc_field, fm.qgis_field) for fm in line.stop_field_mappings] == \
+            [("Colour", "Colour")]
 
     def test_legacy_and_variant_shapes(self):
         cats = categories()

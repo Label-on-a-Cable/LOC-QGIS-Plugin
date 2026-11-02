@@ -35,7 +35,7 @@ except (ImportError, AttributeError):
 
 from ..qt_compat import GEOM_POINT, GEOM_LINE
 from ..models.category import Category, CategoryField
-from ..models.mapping import FieldMapping, LayerMapping
+from ..models.mapping import STOP_IDENTITY_FIELDS, FieldMapping, LayerMapping
 from ..models.route import Route, Stop, StopType
 from .route_generator import generate_routes as _snap_generate_routes
 
@@ -324,6 +324,7 @@ def build_layers(
         # Determine stop category if any multiLocs used this cat
         stop_cat_id = ""
         stop_cat_name = ""
+        stop_cat: Optional[Category] = None
         for mloc in locs_data.get("multiLoc", []):
             dl = (mloc.get("dualLoc") or mloc.get("dualLOC")
                   or mloc.get("dual_loc") or {})
@@ -335,15 +336,15 @@ def build_layers(
                     scid = sl.get("category", sl.get("category_id", ""))
                     if scid:
                         stop_cat_id = scid
-                        sc = cat_lookup.get(scid)
-                        stop_cat_name = sc.name if sc else scid
+                        stop_cat = cat_lookup.get(scid)
+                        stop_cat_name = stop_cat.name if stop_cat else scid
                         break
                 if stop_cat_id:
                     break
 
         mapping = _auto_mapping_line(
             layer, cat_id, cat_name, all_field_names,
-            stop_cat_id, stop_cat_name,
+            stop_cat_id, stop_cat_name, stop_cat,
         )
         mappings.append(mapping)
 
@@ -1344,13 +1345,30 @@ def _auto_mapping_line(
     field_names: List[str],
     stop_cat_id: str = "",
     stop_cat_name: str = "",
+    stop_cat: Optional[Category] = None,
 ) -> LayerMapping:
-    """Build a LayerMapping for an imported line layer."""
+    """Build a LayerMapping for an imported line layer.
+
+    Stop fields are mapped by name onto the line layer's own fields
+    (a stop's Colour from the cable's Colour), the same way the layer's
+    own fields are — otherwise the mapping dialog shows every stop
+    field "(unmapped)" after a pull.  Only stops added later read these
+    values; pulled stops keep what the server holds.
+    """
     fms = []
     for fn in field_names:
         if fn.startswith("_"):
             continue
         fms.append(FieldMapping(loc_field=fn, qgis_field=fn))
+
+    stop_fms = []
+    if stop_cat is not None:
+        by_lower = {fn.lower(): fn for fn in field_names if not fn.startswith("_")}
+        for cf in stop_cat.fields:
+            if cf.name.lower() in STOP_IDENTITY_FIELDS:
+                continue
+            stop_fms.append(FieldMapping(
+                loc_field=cf.name, qgis_field=by_lower.get(cf.name.lower(), "")))
 
     return LayerMapping(
         layer_id=layer.id(),
@@ -1360,6 +1378,7 @@ def _auto_mapping_line(
         field_mappings=fms,
         stop_category_id=stop_cat_id,
         stop_category_name=stop_cat_name,
+        stop_field_mappings=stop_fms,
     )
 
 

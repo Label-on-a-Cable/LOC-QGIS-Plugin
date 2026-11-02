@@ -1383,8 +1383,8 @@ def _build_single_loc_obj(
     standalone single LOCs for the same physical asset.
 
     Field values are read from the LINE feature via stop_field_mappings.
-    Essential fields (uid/name) use stop_field_mappings first, then fall
-    back to the point layer's mapping for the asset identity.
+    Identity (uid/name) comes from the reviewed label or the point
+    layer's mapping, never from stop_field_mappings — see _stop_identity.
 
     If *stop_id_map* is provided (from a pulled line feature's
     ``_stop_loc_ids`` attribute), original server IDs and exact
