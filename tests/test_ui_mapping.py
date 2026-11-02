@@ -6,7 +6,7 @@ from qgis.PyQt.QtCore import QMetaType
 from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox
 
 from fake_loc_server import CAT_CHAMBER, CAT_FIBER, CAT_POLE, CAT_STOPS, LOCATION_ID
-from helpers import build_network, network_mappings, pump, wait_until
+from helpers import build_network, network_mappings, pulled_network, pump, wait_until
 from label_on_a_cable.models.mapping import MappingPreset, load_all_presets, save_preset
 from label_on_a_cable.qt_compat import BB_CANCEL, BB_OK
 from label_on_a_cable.ui.category_mapping_dialog import CategoryMappingDialog
@@ -173,6 +173,21 @@ class TestCategoryMappingDialog:
             for fm in orig.stop_field_mappings:
                 assert got.stop_qgis_field_for(fm.loc_field) == fm.qgis_field
         assert r["Poles"]._detail_widget.isHidden()      # export off → collapsed
+
+    def test_pulled_layers_open_with_stop_fields_mapped(self, qtbot, authed_api, tmp_path):
+        """Regression (ee7a374): push with a stop mapping, pull into a new
+        project, open Category Mapping — the stop section showed
+        "Actual Asset Name (required)" and "Colour" both "(unmapped)"."""
+        net = pulled_network(tmp_path)
+        dlg = open_dialog(qtbot, authed_api, current=net.maps)
+        cable = rows(dlg)["Fiber Cable (LOC)"]
+        assert cable._cat_combo.currentText() == "Fiber Cable"
+        assert cable._stop_cat_combo.currentText() == "Stops"
+        assert [(n, c.currentText()) for n, c in cable._stop_field_combos] == \
+            [("Colour", "Colour")]
+        m = cable.to_mapping()
+        assert m.stop_qgis_field_for("Colour") == "Colour"
+        assert [fm.loc_field for fm in m.stop_field_mappings] == ["Colour"]
 
     def test_export_bulk_toggles(self, qtbot, authed_api, layers):
         dlg = open_dialog(qtbot, authed_api)

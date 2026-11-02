@@ -125,6 +125,25 @@ class TestBuildLayers:
         assert [(fm.loc_field, fm.qgis_field) for fm in line.stop_field_mappings] == \
             [("Colour", "Colour")]
 
+    def test_auto_mapping_line_stop_fields(self, pulled):
+        """Regression (ee7a374): after a pull every stop field showed
+        "(unmapped)" — the auto-mapping never filled stop_field_mappings."""
+        line = pulled[0]["Fiber Cable (LOC)"]
+        names = line.fields().names()
+        cats = categories_by_id()
+        # stop fields map by name; identity fields are never stop fields
+        lm = ib._auto_mapping_line(line, CAT_FIBER, "Fiber Cable", names,
+                                   CAT_STOPS, "Stops", cats[CAT_STOPS])
+        assert [(f.loc_field, f.qgis_field) for f in lm.stop_field_mappings] == \
+            [("Colour", "Colour")]
+        # a stop field the cable layer lacks is listed but left unmapped
+        lm = ib._auto_mapping_line(line, CAT_FIBER, "Fiber Cable", names,
+                                   CAT_POLE, "Pole", cats[CAT_POLE])
+        assert [(f.loc_field, f.qgis_field) for f in lm.stop_field_mappings] == \
+            [("Height", ""), ("Material", "")]
+        # no stop category → nothing to map
+        assert ib._auto_mapping_line(line, CAT_FIBER, "Fiber Cable", names).stop_field_mappings == []
+
     def test_legacy_and_variant_shapes(self):
         cats = categories()
         data = {

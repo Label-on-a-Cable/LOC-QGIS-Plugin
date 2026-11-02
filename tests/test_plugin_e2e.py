@@ -659,6 +659,15 @@ class TestPull:
                 in bar(ui, "success"))
         assert len(p._categories_cache) == 4
 
+    def test_pull_keeps_stop_field_mapping(self, ui):
+        """Regression (ee7a374): the mapping the plugin holds after a pull
+        had the stop category but no stop fields."""
+        self._pull_project(ui)
+        lm = next(m for m in ui.plugin.layer_mappings if m.stop_category_id)
+        assert lm.stop_category_name == "Stops"
+        assert lm.stop_qgis_field_for("Colour") == "Colour"
+        assert lm.stop_qgis_field_for("Actual Asset Name") == ""
+
     def test_pull_then_push_changes_nothing(self, ui):
         self._pull_project(ui)
         before = json.dumps(ui.server.fetch_shape(LOCATION_ID), sort_keys=True)
