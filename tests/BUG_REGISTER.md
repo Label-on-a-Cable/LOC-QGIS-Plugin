@@ -63,6 +63,7 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
 | Staging USA › Socorro, Torrington, Spencer, Mondovi (exact copies of production): pull → Generate → dry run → **real push** → re-pull | 0 created / 0 updated on both dry runs; server data identical before and after; every route "No changes" |
 | Same four locations replayed on the **previous** build `153baea` | Torrington 2 routes / Spencer 4 routes "Modified", 2 and 4 new stops (Bug 13 reproduced on production data) |
 | Live scenarios with pushes on staging Socorro | 10 / 10 passed |
+| Continuous edit chain on staging Mondovi: pull → push → edit → push → edit again → push → pull into a new project → push → revert → push → pull → push | every unedited push 0 / 0, every edit exactly 1 updated, server identical to the backup at the end (ignoring the edited record's `updatedAt`); same chain plus delete on the fake server in `TestEditCycles::test_push_edit_push_pull_edit_pull_delete_chain` |
 | Production Socorro, Torrington, Spencer, Mondovi re-read after the staging pushes | unchanged |
 | Full suite | 357 passed, 96.3 % branch coverage; 10 / 10 bug videos |
 

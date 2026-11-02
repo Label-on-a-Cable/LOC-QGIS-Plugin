@@ -490,6 +490,90 @@ class TestPush:
         assert ui.server.push_count == 0 and ui.urls == []
 
 
+class TestEditCycles:
+    """One continuous session: push, edit, push, edit again, pull into a
+    new project, push, edit, pull again, delete, push — state carries
+    over from step to step, as in real use."""
+
+    def _layer(self, name):
+        return [l for l in QgsProject.instance().mapLayers().values()
+                if l.name() == name][0]
+
+    def _set(self, layer, key_field, key, field, value):
+        fid = [f.id() for f in layer.getFeatures() if f[key_field] == key][0]
+        layer.dataProvider().changeAttributeValues(
+            {fid: {layer.fields().indexOf(field): value}})
+
+    def _single(self, ui, uid):
+        return [s for s in ui.server.loc_state()["single"].values()
+                if s["unique_asset_id"] == uid][0]
+
+    def _new_project_pull(self, ui, name):
+        from qgis.core import QgsCoordinateReferenceSystem
+        QgsProject.instance().clear()
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(ITM))
+        save_project(ui.tmp, name)
+        pull(ui)
+
+    def _counts(self, ui):
+        s = last_preview_stats(ui)
+        return s["Created LOCs"], s["Updated LOCs"], s["Deleted LOCs"]
+
+    def test_push_edit_push_pull_edit_pull_delete_chain(self, ui):
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)                                            # 1. first push
+        assert self._counts(ui) == ("12", "0", "0")
+        ids = server_ids(ui.server)
+
+        self._set(layers["poles"], "PoleID", "P5", "Height", "12")
+        generate(ui)
+        push(ui)                                            # 2. edit → push
+        assert self._counts(ui) == ("0", "1", "0")
+        assert self._single(ui, "P5")["fields"]["Height"] == "12"
+
+        self._set(layers["cables"], "AssetID", "CBL-001", "Colour", "Green")
+        generate(ui)
+        push(ui)                                            # 3. edit again → push
+        c, u, d = self._counts(ui)
+        assert (c, d) == ("0", "0") and int(u) >= 1
+        (multi,) = ui.server.loc_state()["multi"].values()
+        assert multi["dualLoc"]["fields"]["Colour"] == "Green"
+        assert server_ids(ui.server) == ids                 # nothing re-created
+
+        self._new_project_pull(ui, "second.qgz")            # 4. pull into a new project
+        push(ui)
+        assert self._counts(ui) == ("0", "0", "0")
+        assert server_ids(ui.server) == ids
+
+        self._set(self._layer("Pole (LOC)"), "Unique Asset Identifier", "P5",
+                  "Material", "Composite")
+        push(ui)                                            # 5. edit after pull → push
+        assert self._counts(ui) == ("0", "1", "0")
+        p5 = self._single(ui, "P5")
+        assert (p5["fields"]["Height"], p5["fields"]["Material"]) == ("12", "Composite")
+
+        self._new_project_pull(ui, "third.qgz")             # 6. pull again
+        push(ui)
+        assert self._counts(ui) == ("0", "0", "0")
+        assert server_ids(ui.server) == ids
+        cables = self._layer("Fiber Cable (LOC)")
+        assert [f["Colour"] for f in cables.getFeatures() if f["Route ID"] == "CBL-001"] == ["Green"]
+
+        poles = self._layer("Pole (LOC)")
+        poles.dataProvider().deleteFeatures(
+            [f.id() for f in poles.getFeatures() if f["Unique Asset Identifier"] == "P5"])
+        push(ui)                                            # 7. delete → push
+        assert self._counts(ui) == ("0", "0", "1")
+        assert server_ids(ui.server) == ids - {p5["loc_id"]}
+
+        self._new_project_pull(ui, "fourth.qgz")            # 8. pull once more
+        push(ui)
+        assert self._counts(ui) == ("0", "0", "0")
+        assert last_preview_stats(ui)["Total Processed"] == "11"
+        assert ui.server.push_count == 8
+
+
 class TestPushGuards:
     def test_unsaved_project_blocks_push_and_pull(self, ui):
         login(ui)
