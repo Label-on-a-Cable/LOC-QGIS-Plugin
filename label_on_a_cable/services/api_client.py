@@ -4,6 +4,7 @@ Wraps ``requests.Session`` with the base URL, default headers,
 response handling, and one method per API endpoint.
 """
 
+import ipaddress
 import json as _json
 import os
 import logging
@@ -23,11 +24,25 @@ from .exceptions import (
 DEFAULT_TIMEOUT = 30  # seconds
 PUSH_TIMEOUT = 180    # seconds (server statement_timeout = 120s)
 
-# Hosts the server may emit in media URLs by mistake — these are its own
-# nginx upstream address, not something a client machine can reach.
-_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-
 _log = logging.getLogger("LOC.api_client")
+
+
+def _is_unreachable_host(hostname):
+    """True when a URL's host is a loopback or unspecified address.
+
+    The server can emit such hosts in media URLs by mistake — they are its
+    own nginx upstream address, not something a client machine can reach,
+    so the caller rewrites them onto the API host.
+    """
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_unspecified
 
 
 
@@ -214,7 +229,7 @@ class ApiClient:
             parts = urlparse(url)
         except ValueError:
             return url
-        if parts.hostname and parts.hostname.lower() in _LOOPBACK_HOSTS:
+        if _is_unreachable_host(parts.hostname):
             base = urlparse(self.base_url)
             return urlunparse(
                 parts._replace(scheme=base.scheme, netloc=base.netloc)
