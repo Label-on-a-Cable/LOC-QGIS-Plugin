@@ -95,13 +95,18 @@ class TestCategoryMappingDialog:
         cable = rows(dlg)["Fiber Cable"]
         pick(cable._cat_combo, CAT_FIBER)
         assert fields(cable) == ["Route ID", "Fiber Count", "Colour", "Destination", "Length"]
+        assert not cable._stop_hint.isVisibleTo(dlg)  # no stop category yet
         pick(cable._stop_cat_combo, CAT_POLE)  # identity is resolved automatically
         assert [n for n, _ in cable._stop_field_combos] == ["Height", "Material"]
+        # ...and the dialog says so where the identity rows used to be
+        assert cable._stop_hint.isVisibleTo(dlg)
+        assert "structure point" in cable._stop_hint.text()
         pick(cable._stop_cat_combo, CAT_STOPS)
         assert [n for n, _ in cable._stop_field_combos] == ["Colour"]
         assert cable._stop_cat_combo.findData(CAT_FIBER) == -1  # duals never stops
         cable._stop_cat_combo.setCurrentIndex(0)
         assert cable._stop_field_combos == []
+        assert not cable._stop_hint.isVisibleTo(dlg)
 
     def test_injected_essentials_for_bare_categories(self, qtbot, authed_api, loc_server, layers):
         loc_server.categories.append({"id": "bare-dual", "name": "Duct", "LOC_type": "dual"})

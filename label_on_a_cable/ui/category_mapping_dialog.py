@@ -479,6 +479,20 @@ class _LayerRow:
             sc_row.addWidget(self._stop_cat_combo)
             self._detail_layout.addLayout(sc_row)
 
+            # Shown once a stop category is chosen: the identity fields are
+            # deliberately missing from the combos below (see
+            # _rebuild_stop_field_combos), so say where they come from.
+            self._stop_hint = QLabel(
+                "Stop name and ID come from the structure point and the "
+                "Route Review dialog. Only the stop category's other fields "
+                "are mapped here, from the line layer's attributes."
+            )
+            self._stop_hint.setStyleSheet("color: gray; font-size: 11px;")
+            self._stop_hint.setWordWrap(True)
+            self._stop_hint.setContentsMargins(20, 0, 0, 0)  # indent
+            self._stop_hint.setVisible(False)
+            self._detail_layout.addWidget(self._stop_hint)
+
             # Indented stop field mappings (built when stop category changes)
             self._stop_fields_widget = QWidget()
             stop_outer = QHBoxLayout(self._stop_fields_widget)
@@ -577,6 +591,7 @@ class _LayerRow:
                 w.deleteLater()
         self._stop_field_combos.clear()
 
+        self._stop_hint.setVisible(cat is not None)
         if cat is None:
             return
 
