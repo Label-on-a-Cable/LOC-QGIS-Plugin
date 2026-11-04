@@ -440,6 +440,13 @@ def reconstruct_routes(
     pt_index: Dict[
         Tuple[float, float], List[Tuple[str, int, str, str, str]]
     ] = {}
+    # Pulled structures that have been moved in QGIS, by the position
+    # LOC still has them at (``_origin_lon`` / ``_origin_lat``).  The
+    # line's vertex is still there, so this is how a moved stop keeps
+    # its place on the route instead of vanishing from it.
+    moved_index: Dict[
+        Tuple[float, float], List[Tuple[str, int, str, str, str]]
+    ] = {}
 
     for pm in point_mappings:
         layer = project.mapLayer(pm.layer_id)
@@ -451,6 +458,7 @@ def reconstruct_routes(
             or pm.first_mapped_qgis_field()
         )
         uid_field = pm.qgis_field_for("Unique Asset Identifier")
+        pulled_layer = {"_loc_id", "_origin_lon", "_origin_lat"} <= set(layer.fields().names())
         for feat in layer.getFeatures():
             geom = feat.geometry()
             if geom.isEmpty() or geom.isNull():
@@ -459,13 +467,25 @@ def reconstruct_routes(
             key = (round(pt.x(), 8), round(pt.y(), 8))
             name = _safe_feat_attr(feat, name_field)
             asset_id = _safe_feat_attr(feat, uid_field)
-            pt_index.setdefault(key, []).append(
-                (layer.id(), feat.id(), name, pm.category_id, asset_id)
-            )
+            entry = (layer.id(), feat.id(), name, pm.category_id, asset_id)
+            pt_index.setdefault(key, []).append(entry)
+            if pulled_layer and _safe_feat_attr(feat, "_loc_id"):
+                try:
+                    stored = (round(float(_safe_feat_attr(feat, "_origin_lon")), 8),
+                              round(float(_safe_feat_attr(feat, "_origin_lat")), 8))
+                except (TypeError, ValueError):
+                    continue
+                if stored != key:
+                    moved_index.setdefault(stored, []).append(entry)
+
+    def find_point(key, **kw):
+        return (_find_point(pt_index, key, **kw)
+                or _find_point(moved_index, key, **kw))
 
     _log(f"reconstruct_routes: {len(line_mappings)} line layer(s), "
          f"{len(point_mappings)} point layer(s), "
-         f"{len(pt_index)} unique point locations")
+         f"{len(pt_index)} unique point locations, "
+         f"{sum(len(v) for v in moved_index.values())} moved")
 
     routes: List[Route] = []
     # (line layer id, feature id) → (line CRS, rounded vertex coordinates)
@@ -525,8 +545,8 @@ def reconstruct_routes(
 
             # --- Origin = first vertex ---
             o_key = (round(vertices[0].x(), 8), round(vertices[0].y(), 8))
-            o_match = _find_point(pt_index, o_key, exclude_cat=stop_cat_id,
-                                  want_name=origin_name)
+            o_match = find_point(o_key, exclude_cat=stop_cat_id,
+                                 want_name=origin_name)
             if o_match:
                 stops.append(Stop(
                     original_name=o_match[2] or origin_name,
@@ -570,9 +590,9 @@ def reconstruct_routes(
                              if v_idx - 1 + j < len(raw_stops) else None
                              for j in range(run)]
                     matches = [
-                        _find_point(pt_index, key, prefer_cat=stop_cat_id,
-                                    want_in=(info or {}).get("uid", ""),
-                                    want_label=(info or {}).get("name", ""))
+                        find_point(key, prefer_cat=stop_cat_id,
+                                   want_in=(info or {}).get("uid", ""),
+                                   want_label=(info or {}).get("name", ""))
                         for info in infos
                     ]
                     if not matches[0]:
@@ -631,8 +651,8 @@ def reconstruct_routes(
             # --- Destination = last vertex ---
             d_key = (round(vertices[-1].x(), 8),
                      round(vertices[-1].y(), 8))
-            d_match = _find_point(pt_index, d_key, exclude_cat=stop_cat_id,
-                                  want_name=dest_name)
+            d_match = find_point(d_key, exclude_cat=stop_cat_id,
+                                 want_name=dest_name)
             if d_match:
                 stops.append(Stop(
                     original_name=d_match[2] or dest_name,
@@ -704,21 +724,22 @@ def reconstruct_routes(
             line_crs, taken = occupied.get(key, (None, set()))
             on_route = {(s.point_layer_id, s.point_feature_id)
                         for s in route.stops if s.point_feature_id >= 0}
-            # A structure that is not on the route but shares a coordinate
-            # with one of its stops or ends (e.g. a handhole under an
-            # enclosure) is already represented there on the server — it
-            # is not a new stop.  Neither is a pulled structure that still
-            # sits where LOC has it: LOC already decided it is not a stop
-            # on this route, even when it lies within the snap tolerance
-            # (e.g. a drop's home enclosure next to the feeder line).
-            # Stops already on the route stay: they anchor where genuinely
-            # new stops are inserted.
+            # A pulled structure that is not on the route is not a new
+            # stop while it still sits where LOC has it — LOC already
+            # decided it is not a stop here, even within the snap
+            # tolerance (a drop's home enclosure next to the feeder
+            # line) — nor when it shares a coordinate with one of the
+            # route's stops or ends (a handhole under an enclosure).  A
+            # structure drawn in QGIS is the user's edit wherever it is,
+            # even dropped exactly onto an existing stop.  Stops already
+            # on the route stay: they anchor where new stops go.
             snap_route.stops = [
                 s for s in snap_route.stops
                 if s.is_endpoint
                 or (s.point_layer_id, s.point_feature_id) in on_route
-                or (_point_key(project, s, line_crs) not in taken
-                    and not _is_unmoved_pulled_point(project, s))
+                or not (_is_pulled_point(project, s)
+                        and (_point_key(project, s, line_crs) in taken
+                             or _is_unmoved_pulled_point(project, s)))
             ]
             merged = _merge_stops(route, snap_route)
             if merged:
@@ -761,6 +782,27 @@ def _point_key(project, stop: Stop, crs) -> Optional[Tuple[float, float]]:
 _UNMOVED_TOLERANCE_DEG = 1e-7       # ≈ 1 cm; same scale as export's stored coords
 
 
+def _pulled_point_feature(project, stop: Stop):
+    """The stop's point feature when it came from a pull (has a
+    ``_loc_id`` and the server position), else None."""
+    layer = project.mapLayer(stop.point_layer_id)
+    if not isinstance(layer, QgsVectorLayer):
+        return None
+    names = layer.fields().names()
+    if not {"_loc_id", "_origin_lon", "_origin_lat"} <= set(names):
+        return None
+    feat = layer.getFeature(stop.point_feature_id)
+    if not feat.isValid() or feat.geometry().isEmpty():
+        return None
+    if not _safe_feat_attr(feat, "_loc_id"):
+        return None
+    return feat
+
+
+def _is_pulled_point(project, stop: Stop) -> bool:
+    return _pulled_point_feature(project, stop) is not None
+
+
 def _is_unmoved_pulled_point(project, stop: Stop) -> bool:
     """True when the stop's structure came from a pull and has not moved.
 
@@ -768,17 +810,10 @@ def _is_unmoved_pulled_point(project, stop: Stop) -> bool:
     ``_origin_lon`` / ``_origin_lat`` (WGS 84).  New structures have no
     ``_loc_id``; moved ones no longer match their stored position.
     """
+    feat = _pulled_point_feature(project, stop)
+    if feat is None:
+        return False
     layer = project.mapLayer(stop.point_layer_id)
-    if not isinstance(layer, QgsVectorLayer):
-        return False
-    names = layer.fields().names()
-    if not {"_loc_id", "_origin_lon", "_origin_lat"} <= set(names):
-        return False
-    feat = layer.getFeature(stop.point_feature_id)
-    if not feat.isValid() or feat.geometry().isEmpty():
-        return False
-    if not _safe_feat_attr(feat, "_loc_id"):
-        return False
     try:
         lon = float(_safe_feat_attr(feat, "_origin_lon"))
         lat = float(_safe_feat_attr(feat, "_origin_lat"))
@@ -811,6 +846,9 @@ def _merge_stops(recon_route: Route, snap_route: Route) -> int:
     def key(s):
         return (s.point_layer_id, s.point_feature_id)
 
+    # Only the stops the route had before this merge anchor insertions.
+    # A new structure can appear twice in the snap route (its IN and OUT
+    # stops); both are new, so neither must be mistaken for an anchor.
     existing = {key(s) for s in recon_route.stops if s.point_feature_id >= 0}
 
     def last_index_of(k):
@@ -847,7 +885,6 @@ def _merge_stops(recon_route: Route, snap_route: Route) -> int:
             if r.stop_type == StopType.DESTINATION and pos > i:
                 pos = i
         recon_route.stops.insert(pos, s)
-        existing.add(key(s))
         anchor = pos
         added += 1
 

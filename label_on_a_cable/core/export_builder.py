@@ -437,7 +437,9 @@ def stamp_ids_after_push(payload: dict) -> int:
         entry_type = fm["type"]
         idx = fm["index"]
         cache_key = _stamp_cache_key(layer, fid)
-        entry: Dict[str, str] = {}
+        # Which feature this was stamped on, so the entry can follow it
+        # when its asset id is edited later (see _follow_feature).
+        entry: Dict[str, str] = {"_feature_key": _feature_key(layer, fid)}
 
         if entry_type == "multi" and idx < len(multi_locs):
             mloc = multi_locs[idx]
@@ -531,7 +533,7 @@ def stamp_ids_after_push(payload: dict) -> int:
                 sloc.get("actual_asset_name", ""),
             )
 
-        if entry:
+        if len(entry) > 1:
             loc_stamps[cache_key] = entry
             stamped += 1
 
@@ -713,6 +715,7 @@ def sync_stamps_from_server(
             cache_key = _stamp_cache_key(layer, feat.id())
             # Build stamp entry (exclude internal _type marker)
             stamp = {k: v for k, v in server_entry.items() if k != "_type"}
+            stamp["_feature_key"] = _feature_key(layer, feat.id())
             loc_stamps[cache_key] = stamp
             matched += 1
 
@@ -747,7 +750,8 @@ _ASSET_KEY_PREFIX = "asset|"
 
 # layer_id → (category_id, candidate identity fields), set from mappings
 _layer_identity: Dict[str, Tuple[str, List[str]]] = {}
-_ambiguous_asset_keys: set = set()
+_live_asset_keys: set = set()        # asset keys some current feature has
+_ambiguous_asset_keys: set = set()   # ...and that several features share
 _key_memo: Dict[Tuple[str, int], str] = {}
 
 
@@ -759,6 +763,7 @@ def set_layer_mappings(layer_mappings: List[LayerMapping]) -> None:
     category are recorded as ambiguous and fall back to per-feature keys.
     """
     _layer_identity.clear()
+    _live_asset_keys.clear()
     _ambiguous_asset_keys.clear()
     _key_memo.clear()
     project = QgsProject.instance()
@@ -783,6 +788,7 @@ def set_layer_mappings(layer_mappings: List[LayerMapping]) -> None:
             key = _asset_key_for(layer, feat)
             if key:
                 seen[key] = seen.get(key, 0) + 1
+    _live_asset_keys.update(seen)
     _ambiguous_asset_keys.update(k for k, n in seen.items() if n > 1)
 
 _stamp_cache: Optional[Dict[str, dict]] = None  # full file contents
@@ -846,9 +852,49 @@ def _stamp_cache_key(layer: QgsVectorLayer, fid: int) -> str:
             if key in _ambiguous_asset_keys:
                 key = ""
     if not key:
-        key = f"{layer.source()}:{fid}"
+        key = _feature_key(layer, fid)
+    _follow_feature(layer, fid, key)
     _key_memo[memo] = key
     return key
+
+
+def _feature_key(layer: QgsVectorLayer, fid: int) -> str:
+    return f"{layer.source()}:{fid}"
+
+
+def _follow_feature(layer: QgsVectorLayer, fid: int, key: str) -> None:
+    """Re-file a saved entry under *key* when it was stamped on this very
+    feature under another key.
+
+    The asset key follows the feature's Route ID / Unique Asset
+    Identifier, so correcting that value after a push would otherwise
+    orphan the saved IDs and the next push would delete the record (and
+    every stop under it) and create it afresh.  Entries record the
+    feature they were stamped on (``_feature_key``); when the current
+    key is unknown but that feature's entry exists, the entry moves.  It
+    stays put when another feature now holds its asset id — unless that
+    id is shared (a copy-pasted structure), where the original keeps its
+    record under a per-feature key and the copy starts fresh.
+    """
+    if not _active_location_id:
+        return
+    loc_stamps = _load_stamp_cache().get(_active_location_id)
+    if not loc_stamps or key in loc_stamps:
+        return
+    feature_key = _feature_key(layer, fid)
+    old_key = next((k for k, e in loc_stamps.items()
+                    if isinstance(e, dict) and e.get("_feature_key") == feature_key
+                    and k != feature_key), "")
+    if not old_key:
+        return
+    if old_key in _live_asset_keys and old_key not in _ambiguous_asset_keys:
+        return
+    loc_stamps[key] = loc_stamps.pop(old_key)
+    _save_stamp_cache(_load_stamp_cache())
+    QgsMessageLog.logMessage(
+        f"Saved LOC IDs follow the edited asset id: {old_key} -> {key}",
+        "LOC Export", Qgis.MessageLevel.Info,
+    )
 
 
 def _migrate_stamps(
@@ -889,16 +935,24 @@ def _migrate_stamps(
 
     upgraded = 0
     for old_key in legacy:
-        entry = loc_stamps[old_key]
+        entry = loc_stamps.get(old_key)
+        if entry is None:
+            upgraded += 1      # re-filed by _follow_feature meanwhile
+            continue
         new_key = ""
         source, _, fid_text = old_key.rpartition(":")
+        asset_id = entry.get("_unique_asset_id") or entry.get("_route_name") or ""
         layer = layers_by_source.get(source)
         if layer is not None and fid_text.lstrip("-").isdigit():
             candidate = _stamp_cache_key(layer, int(fid_text))
-            if candidate.startswith(_ASSET_KEY_PREFIX):
+            # The fid only identifies the feature while the entry's own
+            # asset name agrees: a Shapefile renumbered since the 1.6.x
+            # push puts another asset under that fid.
+            if candidate.startswith(_ASSET_KEY_PREFIX) and (
+                    not asset_id
+                    or candidate.split("|", 2)[2].lower() == asset_id.strip().lower()):
                 new_key = candidate
         if not new_key:
-            asset_id = entry.get("_unique_asset_id") or entry.get("_route_name") or ""
             matches = by_asset_id.get(asset_id, [])
             if len(matches) == 1:
                 new_key = matches[0]
@@ -1913,6 +1967,11 @@ def _rebuild_stops_from_raw(
             v = _safe_value(line_feature, route_id_qfield)
             if v:
                 route_uid = v
+    # The route id the server's stop identities were built on; when the
+    # Route ID has been edited since the pull, the stops follow it.
+    raw_dl = (raw_mloc.get("dualLoc") or raw_mloc.get("dualLOC")
+              or raw_mloc.get("dual_loc") or {})
+    old_route_uid = raw_dl.get("unique_asset_id") or raw_mloc.get("multiName") or ""
 
     stop_cat = categories.get(line_mapping.stop_category_id)
 
@@ -1936,6 +1995,13 @@ def _rebuild_stops_from_raw(
         )
         coord_key = (round(pt_xy[0], 8), round(pt_xy[1], 8))
         orig_list = orig_by_coord.get(coord_key)
+        if not orig_list and pt_feature is not None:
+            # A moved structure: its pull-time position still names
+            # the server stop it is.
+            stored = _stored_xy(pt_feature, "_origin_lon", "_origin_lat")
+            if stored:
+                orig_list = orig_by_coord.get(
+                    (round(stored[0], 8), round(stored[1], 8)))
         matched_entry = orig_list.pop(0) if orig_list else None
         if matched_entry is not None:
             claimed.add(id(matched_entry))
@@ -2022,6 +2088,14 @@ def _rebuild_stops_from_raw(
                 else:
                     patched_sloc["unique_asset_id"] = new_base_uid
                 patched_sloc["actual_asset_name"] = actual_name
+            elif (old_route_uid and route_uid != old_route_uid
+                    and orig_uid.startswith(f"{old_route_uid}_")):
+                # Route ID edited after the pull: "<route>_<structure>"
+                # identities keep the structure part and take the new
+                # route part.
+                patched_sloc["unique_asset_id"] = (
+                    route_uid + orig_uid[len(old_route_uid):])
+                patched_sloc["updatedAt"] = now
             patched_sloc["location_id"] = location.location_id
 
             # If stopNumber changed, bump updatedAt and patch name

@@ -533,15 +533,21 @@ class TestStampMigration:
         keys = eb._load_stamp_cache()[LOCATION_ID]
         assert f"asset|{CAT_POLE}|P1" not in keys          # per-feature keys instead
 
-    def _to_legacy_sidecar(self, net):
-        """Rewrite the saved IDs in the old layer_source:fid format."""
+    def _to_legacy_sidecar(self, net, rotate_fids=False):
+        """Rewrite the saved IDs in the old layer_source:fid format.
+
+        With *rotate_fids* every entry is filed under the NEXT feature's
+        id in its layer — a Shapefile whose features were renumbered
+        since the 1.6.x push that wrote the sidecar."""
         cache = eb._load_stamp_cache()
         legacy_of = {}
         for layer in net.layers.values():
-            for f in layer.getFeatures():
+            feats = list(layer.getFeatures())
+            for i, f in enumerate(feats):
                 k = eb._asset_key_for(layer, f)
                 if k:
-                    legacy_of[k] = f"{layer.source()}:{f.id()}"
+                    fid = feats[(i + 1) % len(feats)].id() if rotate_fids else f.id()
+                    legacy_of[k] = f"{layer.source()}:{fid}"
         cache[LOCATION_ID] = {legacy_of.get(k, k): v
                               for k, v in cache[LOCATION_ID].items()}
         (net.tmp / "network_loc_stamps.json").write_text(json.dumps(cache))
@@ -568,6 +574,83 @@ class TestStampMigration:
         assert eb._migrate_stamps(net.routes, net.maps, LOCATION_ID) == 0
         eb.stamp_ids_after_push(build(net))
         assert eb._migrate_stamps(net.routes, net.maps, LOCATION_ID) == 0
+
+    def test_old_sidecar_with_renumbered_fids_follows_assets(self, net):
+        """A 1.6.x sidecar names each asset in its entry (_route_name /
+        _unique_asset_id); when the feature ids no longer line up, the
+        upgrade must trust the asset name, not the fid."""
+        p1 = build(net)
+        eb.stamp_ids_after_push(p1)
+        self._to_legacy_sidecar(net, rotate_fids=True)
+        p2 = build(net)
+        assert sorted(all_ids(p2)) == sorted(all_ids(p1))
+        assert timestamps(p2) == timestamps(p1)
+
+    # --- the asset id itself is edited after a push -------------------
+
+    def _rename(self, layer, field, old, new):
+        f = feature_where(layer, field, old)
+        layer.dataProvider().changeAttributeValues(
+            {f.id(): {layer.fields().indexOf(field): new}})
+
+    def test_renamed_route_id_keeps_route_and_stops(self, net):
+        """Fixing a Route ID typo after a push must not delete and
+        re-create the route and every stop on the server."""
+        p1 = build(net)
+        eb.stamp_ids_after_push(p1)
+        self._rename(net.layers["cables"], "AssetID", "CBL-001", "CBL-001A")
+        net.routes = rg.generate_routes(net.maps)
+        p2 = build(net)
+        m1 = p1["multiLocs"][0]
+        m2 = [m for m in p2["multiLocs"] if m["multiName"] == "CBL-001A"][0]
+        assert m2["id"] == m1["id"]
+        assert m2["dualLoc"]["loc_id"] == m1["dualLoc"]["loc_id"]
+        assert [s["singleLoc"]["loc_id"] for s in m2["Stops"]] == \
+            [s["singleLoc"]["loc_id"] for s in m1["Stops"]]
+        assert [s["stop_id"] for s in m2["Stops"]] == [s["stop_id"] for s in m1["Stops"]]
+        keys = eb._load_stamp_cache()[LOCATION_ID]
+        assert f"asset|{CAT_FIBER}|CBL-001A" in keys
+        assert f"asset|{CAT_FIBER}|CBL-001" not in keys
+
+    def test_renamed_structure_keeps_record(self, net):
+        p1 = build(net)
+        eb.stamp_ids_after_push(p1)
+        self._rename(net.layers["poles"], "PoleID", "P5", "P5A")
+        p2 = build(net)
+
+        def ids(p, uid):
+            return [s["attributes"]["loc_id"] for s in p["single_locs"]
+                    if s["unique_asset_id"] == uid]
+        assert ids(p2, "P5A") == ids(p1, "P5") and ids(p2, "P5") == []
+        # The id is part of the record, so this is a real update...
+        assert timestamps(p2)["P5A"] != timestamps(p1)["P5"]
+        # ...and nothing else is.
+        assert {k: v for k, v in timestamps(p2).items() if k != "P5A"} == \
+            {k: v for k, v in timestamps(p1).items() if k != "P5"}
+
+    def test_pasted_duplicate_keeps_the_originals_record(self, net):
+        """Copy-pasting a structure gives two features one asset id; the
+        original must keep its record and the copy get a new one."""
+        p1 = build(net)
+        eb.stamp_ids_after_push(p1)
+        poles = net.layers["poles"]
+        p5 = feature_where(poles, "PoleID", "P5")
+        copy = QgsFeature(poles.fields())
+        copy.setGeometry(QgsGeometry(p5.geometry()))
+        for name in poles.fields().names():
+            copy.setAttribute(name, p5[name])
+        poles.dataProvider().addFeatures([copy])
+        p2 = build(net)
+
+        def loc_id_of(p, fid):
+            idx = [fm["index"] for fm in p["_feature_map"]
+                   if fm["type"] == "single" and fm["layer_id"] == poles.id()
+                   and fm["feature_id"] == fid][0]
+            return p["single_locs"][idx]["attributes"]["loc_id"]
+        assert loc_id_of(p2, p5.id()) == loc_id_of(p1, p5.id())
+        new_fid = [f.id() for f in poles.getFeatures() if f.id() != p5.id()
+                   and f["PoleID"] == "P5"][0]
+        assert loc_id_of(p2, new_fid) not in all_ids(p1)
 
 
 # ----------------------------------------------------------------------
@@ -881,8 +964,8 @@ class TestPulledRoundTrip:
             [[s["singleLoc"][k] for k in keys] for s in raw]
 
     def test_generate_ignores_colocated_structure_that_is_not_a_stop(self, tmp_path):
-        """A structure sharing a stop's position but not on the route in
-        LOC (Handhole 35 under FD Enclosure 26) is not a new stop."""
+        """A pulled structure sharing a stop's position but not on the
+        route in LOC (Handhole 35 under FD Enclosure 26) is not a new stop."""
         p = pulled_network(tmp_path)
         poles = p.layers["Pole (LOC)"]
         p2 = feature_where(poles, "Unique Asset Identifier", "P2")
@@ -890,6 +973,8 @@ class TestPulledRoundTrip:
         f.setGeometry(QgsGeometry(p2.geometry()))
         f.setAttribute("Unique Asset Identifier", "HZ")
         f.setAttribute("Actual Asset Name", "Handhole Z")
+        for hidden in ("_loc_id", "_origin_lon", "_origin_lat"):   # came from LOC
+            f.setAttribute(hidden, "hz-1" if hidden == "_loc_id" else p2[hidden])
         poles.dataProvider().addFeatures([f])
         routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
         r = [r for r in routes if r.line_name == "CBL-001"][0]
@@ -940,6 +1025,78 @@ class TestPulledRoundTrip:
         lids = [s["singleLoc"]["loc_id"] for s in payload["multiLocs"][0]["Stops"]]
         assert len(set(lids)) == len(lids)
         assert eb.validate_payload(payload) == []
+
+    # --- a stop's structure is moved in QGIS ------------------------------
+
+    def _move_pulled(self, p, name, dlon):
+        poles = p.layers["Pole (LOC)"]
+        f = feature_where(poles, "Actual Asset Name", name)
+        pt = f.geometry().asPoint()
+        poles.dataProvider().changeGeometryValues(
+            {f.id(): QgsGeometry.fromPointXY(QgsPointXY(pt.x() + dlon, pt.y()))})
+
+    def _stop_named(self, stops, uid):
+        return [s for s in stops if s["singleLoc"]["unique_asset_id"] == uid]
+
+    def test_moved_stop_without_generate_is_still_a_stop(self, tmp_path):
+        """Nudging a stop's structure (~30 cm) and pushing without
+        Generate must move the stop, not delete it."""
+        p = pulled_network(tmp_path)
+        raw = self._raw_stops(p)
+        self._move_pulled(p, "Pole 3", 5e-6)
+        routes = ib.reconstruct_routes(p.maps, skip_snapping=True)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        assert "Pole 3" in [s.structure_name for s in r.stops]
+        payload = build_pulled(p, routes)
+        assert payload["_deleted_loc_ids"] == []
+        (p3,) = self._stop_named(payload["multiLocs"][0]["Stops"], "CBL-001_Pole 3")
+        assert p3["singleLoc"]["loc_id"] in raw
+        assert p3["singleLoc"]["origin_longitude"] != \
+            raw[p3["singleLoc"]["loc_id"]]["singleLoc"]["origin_longitude"]
+
+    def test_moved_stop_keeps_its_record_when_another_stop_is_removed(self, tmp_path):
+        """Counts differ, so the sequential fallback is off; the moved
+        stop must still be matched to its own record."""
+        p = pulled_network(tmp_path)
+        raw = self._raw_stops(p)
+        self._move_pulled(p, "Pole 3", 5e-6)
+        routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        for s in r.stops:
+            if s.structure_name == "Pole 2":
+                s.removed = True
+        payload = build_pulled(p, routes)
+        stops = payload["multiLocs"][0]["Stops"]
+        (p3,) = self._stop_named(stops, "CBL-001_Pole 3")
+        p3_old = [lid for lid, s in raw.items()
+                  if s["singleLoc"]["unique_asset_id"] == "CBL-001_Pole 3"][0]
+        assert p3["singleLoc"]["loc_id"] == p3_old
+        assert p3["singleLoc"]["origin_longitude"] != raw[p3_old]["singleLoc"]["origin_longitude"]
+        assert payload["_deleted_loc_ids"] == [
+            lid for lid, s in raw.items()
+            if s["singleLoc"]["unique_asset_id"] == "CBL-001_Pole 2"]
+        assert eb.validate_payload(payload) == []
+
+    def test_renamed_route_id_renames_its_stops(self, tmp_path):
+        """Stop identities are '<route>_<structure>'; editing the pulled
+        Route ID must carry into them, keeping every record."""
+        p = pulled_network(tmp_path)
+        raw = self._raw_stops(p)
+        cables = p.layers["Fiber Cable (LOC)"]
+        f = feature_where(cables, "Route ID", "CBL-001")
+        cables.dataProvider().changeAttributeValues(
+            {f.id(): {cables.fields().indexOf("Route ID"): "CBL-001A"}})
+        routes = ib.reconstruct_routes(p.maps, skip_snapping=True)
+        payload = build_pulled(p, routes)
+        m = [m for m in payload["multiLocs"] if m["multiName"] == "CBL-001A"][0]
+        assert m["dualLoc"]["unique_asset_id"] == "CBL-001A"
+        assert [s["singleLoc"]["unique_asset_id"] for s in m["Stops"]] == [
+            "CBL-001A_Pole 2", "CBL-001A_Chamber 1_IN",
+            "CBL-001A_Chamber 1_OUT", "CBL-001A_Pole 3"]
+        assert [s["singleLoc"]["actual_asset_name"] for s in m["Stops"]] == \
+            [s["singleLoc"]["actual_asset_name"] for s in raw.values()]
+        assert [s["singleLoc"]["loc_id"] for s in m["Stops"]] == list(raw)
+        assert payload["_deleted_loc_ids"] == []
 
     def test_variant_keys_normalised(self, tmp_path):
         def mutate(data):

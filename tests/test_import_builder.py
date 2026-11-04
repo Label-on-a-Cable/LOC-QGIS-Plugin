@@ -342,6 +342,54 @@ class TestReconstructRoutes:
         poles.dataProvider().changeAttributeValues({p1.id(): {idx: "not a number"}})
         assert not ib._is_unmoved_pulled_point(project, stop)
 
+    def test_new_ingress_egress_structure_adds_both_stops(self, pulled):
+        """A chamber added to a pulled route gets its IN and OUT stops,
+        not only the IN."""
+        layers, mappings, *_ = pulled
+        chambers, cables = layers["Chamber (LOC)"], layers["Fiber Cable (LOC)"]
+        for m in mappings:
+            if m.layer_id == chambers.id():
+                m.default_stop_type = "ingress_egress"
+        verts = [f for f in cables.getFeatures()
+                 if f["Route ID"] == "CBL-001"][0].geometry().asPolyline()
+        mid = QgsPointXY((verts[1].x() + verts[2].x()) / 2,
+                         (verts[1].y() + verts[2].y()) / 2)   # between P2 and CH1
+        nf = QgsFeature(chambers.fields())
+        nf.setGeometry(QgsGeometry.fromPointXY(mid))
+        nf.setAttribute("Unique Asset Identifier", "CH-NEW")
+        nf.setAttribute("Actual Asset Name", "New Chamber")
+        chambers.dataProvider().addFeatures([nf])
+        r1 = [r for r in ib.reconstruct_routes(mappings, snap_tolerance=1.0)
+              if r.line_name == "CBL-001"][0]
+        assert [(s.structure_name, s.stop_type, s.stop_number) for s in r1.stops] == [
+            ("Pole 1", StopType.ORIGIN, 0),
+            ("Pole 2", StopType.PASSTHROUGH, 1),
+            ("New Chamber", StopType.INGRESS, 2),
+            ("New Chamber", StopType.EGRESS, 2),
+            ("Chamber 1", StopType.INGRESS, 3),
+            ("Chamber 1", StopType.EGRESS, 3),
+            ("Pole 3", StopType.PASSTHROUGH, 4),
+            ("Pole 4", StopType.DESTINATION, 0),
+        ]
+
+    def test_new_structure_on_an_existing_stop_becomes_a_stop(self, pulled):
+        """An enclosure dropped exactly into a vault that is already a
+        stop is a new stop beside it (only pulled, unmoved structures
+        are left out — see test_generate_ignores_colocated_structure...)."""
+        layers, mappings, *_ = pulled
+        poles = layers["Pole (LOC)"]
+        p2 = [f for f in poles.getFeatures() if f["Unique Asset Identifier"] == "P2"][0]
+        nf = QgsFeature(poles.fields())
+        nf.setGeometry(QgsGeometry(p2.geometry()))
+        nf.setAttribute("Unique Asset Identifier", "ENC-1")
+        nf.setAttribute("Actual Asset Name", "Enclosure 1")
+        poles.dataProvider().addFeatures([nf])
+        r1 = [r for r in ib.reconstruct_routes(mappings, snap_tolerance=1.0)
+              if r.line_name == "CBL-001"][0]
+        names = [s.structure_name for s in r1.stops]
+        assert names.index("Enclosure 1") in (1, 2)       # next to Pole 2
+        assert r1.active_stop_count == 5
+
     def test_snapped_stop_inserted_in_line_order(self, pulled):
         layers, mappings, *_ = pulled
         poles, cables = layers["Pole (LOC)"], layers["Fiber Cable (LOC)"]
