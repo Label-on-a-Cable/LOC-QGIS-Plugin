@@ -119,6 +119,9 @@ class TestCategoryMappingDialog:
         assert fields(poles) == ["Unique Asset Identifier", "Actual Asset Name"]
         pick(cable._stop_cat_combo, "bare-single")
         assert cable._stop_field_combos == []
+        assert cable._stop_hint.text().endswith("has no other fields.")
+        pick(cable._stop_cat_combo, CAT_STOPS)
+        assert not cable._stop_hint.text().endswith("has no other fields.")
 
     def test_build_mapping_and_accept(self, qtbot, authed_api, layers):
         dlg = open_dialog(qtbot, authed_api, snap=2.5)
