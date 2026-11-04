@@ -6,7 +6,7 @@ import pytest
 from qgis.PyQt.QtWidgets import QLabel, QPushButton
 
 from fake_loc_server import LOCATION_ID
-from helpers import pump, seed_server, wait_until
+from helpers import location_items, pump, seed_server, wait_until
 from label_on_a_cable.qt_compat import BB_OK, BB_CANCEL
 from label_on_a_cable.services.auth_service import AuthService
 from label_on_a_cable.models.location import Location
@@ -137,13 +137,20 @@ class TestLocationSidebar:
         assert not s._btn_refresh.isEnabled()
         wait_until(lambda: s._task is None, message="locations")
 
-    def test_tree_grouped_by_gid(self, sidebar):
+    def test_tree_grouped_by_gid_and_project(self, sidebar):
+        """Global Identifier → Project → Location, like the dashboard (1.6.3)."""
         self._fetch(sidebar)
         tree = sidebar._tree
         assert tree.topLevelItemCount() == 1
         gid = tree.topLevelItem(0)
         assert gid.text(0) == "Test GID (2 locations)" and gid.isExpanded()
-        assert [gid.child(i).text(0) for i in range(gid.childCount())] == \
+        projects = [gid.child(i) for i in range(gid.childCount())]
+        assert [p.text(0) for p in projects] == \
+            ["Other Project (1 location)", "Test Project (1 location)"]
+        assert all(p.isExpanded() for p in projects)
+        assert [[p.child(i).text(0) for i in range(p.childCount())] for p in projects] == \
+            [["Other Location"], ["Testing Location"]]
+        assert [it.text(0) for it in location_items(tree)] == \
             ["Other Location", "Testing Location"]
         assert sidebar._btn_refresh.isEnabled() and not sidebar._status.isVisible()
 
@@ -151,9 +158,10 @@ class TestLocationSidebar:
         self._fetch(sidebar)
         got = collect(sidebar.location_selected)
         gid = sidebar._tree.topLevelItem(0)
-        sidebar._tree.itemClicked.emit(gid, 0)          # group row: ignored
-        assert got == []
+        sidebar._tree.itemClicked.emit(gid, 0)          # group rows: ignored
         sidebar._tree.itemClicked.emit(gid.child(1), 0)
+        assert got == []
+        sidebar._tree.itemClicked.emit(location_items(gid)[1], 0)
         (loc,), = got
         assert isinstance(loc, Location) and loc.location_id == LOCATION_ID
         assert sidebar._selection_label.text() == "Selected: Testing Location."
@@ -161,7 +169,8 @@ class TestLocationSidebar:
     def test_single_location_and_missing_gid(self, sidebar, loc_server):
         loc_server.locations = [dict(loc_server.locations[0], gid_name="")]
         self._fetch(sidebar)
-        assert sidebar._tree.topLevelItem(0).text(0) == "(No GID) (1 location)"
+        assert sidebar._tree.topLevelItem(0).text(0) == \
+            "(No Global Identifier) (1 location)"
 
     def test_no_locations(self, sidebar, loc_server):
         loc_server.locations = []

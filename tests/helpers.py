@@ -253,6 +253,28 @@ def feature_where(layer, field, value):
     return [f for f in layer.getFeatures() if f[field] == value][0]
 
 
+def location_items(tree_or_item):
+    """Every selectable location row under a Workspace tree (or one of
+    its group rows), whatever the grouping depth — Global Identifier →
+    Project → Location since 1.6.3."""
+    from label_on_a_cable.qt_compat import USER_ROLE
+    out = []
+
+    def walk(item):
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.data(0, USER_ROLE) is not None:
+                out.append(child)
+            walk(child)
+
+    if hasattr(tree_or_item, "topLevelItemCount"):
+        for i in range(tree_or_item.topLevelItemCount()):
+            walk(tree_or_item.topLevelItem(i))
+    else:
+        walk(tree_or_item)
+    return out
+
+
 _POINT_COLOURS = ["#e08a1e", "#3d7dd8", "#2e9e4f", "#b04fc8"]
 
 
@@ -331,5 +353,5 @@ __all__ = [
     "CAT_CHAMBER", "CAT_FIBER", "CAT_POLE", "CAT_STOPS", "LOCATION_ID",
     "ITM", "X0", "Y0", "pump", "wait_until", "wait_task", "add_points",
     "add_lines", "build_network", "categories", "categories_by_id",
-    "location", "network_mappings", "save_project",
+    "location", "location_items", "network_mappings", "save_project",
 ]

@@ -8,7 +8,10 @@ from qgis.core import QgsSettings
 
 from fake_loc_server import CAT_POLE, LOCATION_ID, ORG_ID, PNG_BYTES
 from label_on_a_cable.services import config
-from label_on_a_cable.services.api_client import ApiClient, _extract_request_id
+from label_on_a_cable.services import api_client
+from label_on_a_cable.services.api_client import (
+    ApiClient, _extract_request_id, _is_unreachable_host,
+)
 from label_on_a_cable.services.auth_service import AuthService
 from label_on_a_cable.services.exceptions import (
     AuthenticationException, LOCAPIException, NetworkException,
@@ -289,7 +292,24 @@ class TestFetchMedia:
         paths = [r["path"] for r in loc_server.requests[-2:]]
         assert paths == ["/media/sign/chamber", "/media/chamber.png"]
 
-    def test_off_host_signed_url_drops_auth(self, authed_api, loc_server, media_server):
+    @pytest.mark.parametrize("host, unreachable", [
+        ("localhost", True), ("LOCALHOST", True), ("127.0.0.1", True),
+        ("127.0.0.2", True), ("0.0.0.0", True), ("::1", True), ("::", True),
+        ("stagingapi.loc.store", False), ("10.0.0.5", False), ("", False),
+        (None, False),
+    ])
+    def test_unreachable_hosts(self, host, unreachable):
+        """1.6.3: classified by address class, with no literal in the
+        source (the plugin repository's scanner flagged "0.0.0.0")."""
+        assert _is_unreachable_host(host) is unreachable
+
+    def test_off_host_signed_url_drops_auth(self, authed_api, loc_server,
+                                            media_server, monkeypatch):
+        # The media server can only live on a loopback alias here, which
+        # the plugin would rewrite onto the API host; this test is about
+        # the Authorization header, so treat that alias as a foreign host.
+        monkeypatch.setattr(api_client, "_is_unreachable_host",
+                            lambda host: host == "localhost")
         loc_server.signed_media_host = media_server.base_url
         data = authed_api.fetch_media(f"{loc_server.base_url}/media/sign/chamber")
         assert data == PNG_BYTES

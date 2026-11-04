@@ -31,7 +31,10 @@ from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import QDialog, QFormLayout, QLabel, QPlainTextEdit, QVBoxLayout
 
 import label_on_a_cable
-from helpers import pump, refresh_map, save_project, seed_server, show_map, wait_until
+from helpers import (
+    location_items, pump, refresh_map, save_project, seed_server, show_map,
+    wait_until,
+)
 from label_on_a_cable.models.route import StopType
 from label_on_a_cable.qt_compat import BB_OK
 from label_on_a_cable.services import config as loc_config
@@ -187,8 +190,7 @@ def open_location(lv):
     assert gid is not None, f"Global Identifier {lv.t.gid!r} not in Workspace"
     tree.scrollToItem(gid)
     act(lv, f"Result: Workspace lists locations; expand “{lv.t.gid}”")
-    loc = next((gid.child(i) for i in range(gid.childCount())
-                if gid.child(i).text(0) == lv.t.location), None)
+    loc = next((it for it in location_items(gid) if it.text(0) == lv.t.location), None)
     assert loc is not None, f"Location {lv.t.location!r} not under {lv.t.gid!r}"
     tree.setCurrentItem(loc)
     tree.scrollToItem(loc)

@@ -16,8 +16,8 @@ from qgis.PyQt.QtWidgets import QMessageBox, QPushButton
 import label_on_a_cable
 from fake_loc_server import LOCATION_ID, OTHER_LOCATION_ID
 from helpers import (
-    ITM, build_network, network_mappings, pump, save_project, seed_server,
-    wait_task, wait_until,
+    ITM, build_network, location_items, network_mappings, pump, save_project,
+    seed_server, wait_task, wait_until,
 )
 from label_on_a_cable.core import export_builder as eb
 from label_on_a_cable.core import route_generator as rg
@@ -77,9 +77,7 @@ def select_location(ui, name="Testing Location"):
     ui.plugin.actions["workspace"].trigger()
     sb = ui.plugin._sidebar
     wait_until(lambda: sb._task is None, message="locations")
-    gid = sb._tree.topLevelItem(0)
-    item = [gid.child(i) for i in range(gid.childCount())
-            if gid.child(i).text(0) == name][0]
+    item = [it for it in location_items(sb._tree) if it.text(0) == name][0]
     sb._tree.itemClicked.emit(item, 0)
 
 

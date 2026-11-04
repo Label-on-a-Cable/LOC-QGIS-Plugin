@@ -22,8 +22,8 @@ from qgis.PyQt.QtWidgets import QDialog, QFormLayout, QLabel, QPlainTextEdit, QV
 import label_on_a_cable
 from fake_loc_server import LOCATION_ID
 from helpers import (
-    ITM, build_network, feature_where, network_mappings, pump, refresh_map,
-    save_project, seed_server, show_map, wait_until,
+    ITM, build_network, feature_where, location_items, network_mappings, pump,
+    refresh_map, save_project, seed_server, show_map, wait_until,
 )
 from label_on_a_cable.qt_compat import BB_OK
 from label_on_a_cable.ui.category_mapping_dialog import CategoryMappingDialog
@@ -71,9 +71,8 @@ def choose_location(v):
     v.plugin.actions["workspace"].trigger()
     sb = v.plugin._sidebar
     wait_until(lambda: sb._task is None)
-    gid = sb._tree.topLevelItem(0)
-    item = [gid.child(i) for i in range(gid.childCount())
-            if gid.child(i).text(0) == "Testing Location"][0]
+    item = [it for it in location_items(sb._tree)
+            if it.text(0) == "Testing Location"][0]
     sb._tree.setCurrentItem(item)
     sb._tree.itemClicked.emit(item, 0)
     v.rec.step("Workspace: select “Testing Location”")

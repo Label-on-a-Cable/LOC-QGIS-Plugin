@@ -127,8 +127,10 @@ def loc_server(monkeypatch):
 def media_server():
     """A second fake server on another host, like pre-signed S3.
 
-    127.0.0.2 is loopback on Linux but not one of the hosts the plugin
-    rewrites to the API origin, so it is treated as genuinely off-host.
+    127.0.0.2 is a loopback alias on Linux.  Since 1.6.3 the plugin
+    rewrites every loopback host onto the API origin, so a test that
+    needs this server reached as a foreign host narrows that check
+    (see TestFetchMedia).
     """
     server = FakeLocServer(host="127.0.0.2").start()
     yield server
