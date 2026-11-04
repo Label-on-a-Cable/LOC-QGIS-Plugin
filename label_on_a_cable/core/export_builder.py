@@ -32,6 +32,7 @@ import hashlib as _hashlib
 import json as _json
 import os
 import pathlib as _pathlib
+from dataclasses import dataclass, field as _dc_field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -100,7 +101,6 @@ def build_payload(
     location: Location,
     user_id: str,
     organization_id: str,
-    pulled_loc_ids: Optional[set] = None,
 ) -> dict:
     """Build the complete LOCs/plugin-v3 push payload.
 
@@ -109,10 +109,10 @@ def build_payload(
     delete list in the API — leaving an entry out of the payload IS the
     delete.
 
-    If *pulled_loc_ids* is provided (non-empty set), any pulled loc_id
-    that is no longer present in the payload is listed under the
-    internal ``_deleted_loc_ids`` key (stripped before sending) so the
-    push preview can warn the operator about impending deletions.
+    Which LOCs that would remove is *not* decided here: it depends on
+    the location's live server contents, so it is predicted by
+    ``predict_deletions()`` against a fetch taken immediately before the
+    push preview.
     """
     project = QgsProject.instance()
     now = _now_iso()
@@ -337,31 +337,7 @@ def build_payload(
         "_stale_stop_drops": _stale_stop_drops,
     }
 
-    if pulled_loc_ids:
-        present_ids = _collect_payload_loc_ids(payload)
-        payload["_deleted_loc_ids"] = sorted(pulled_loc_ids - present_ids)
-
     return payload
-
-
-def _collect_payload_loc_ids(payload: dict) -> set:
-    """Return every loc_id referenced by the outgoing payload."""
-    ids: set = set()
-    for sl in payload.get("single_locs", []):
-        if sl.get("loc_id"):
-            ids.add(sl["loc_id"])
-    for dl in payload.get("dual_locs", []):
-        if dl.get("loc_id"):
-            ids.add(dl["loc_id"])
-    for ml in payload.get("multiLocs", []):
-        dl = ml.get("dualLoc", {})
-        if isinstance(dl, dict) and dl.get("loc_id"):
-            ids.add(dl["loc_id"])
-        for stop in ml.get("Stops", []):
-            sl = stop.get("singleLoc", {})
-            if isinstance(sl, dict) and sl.get("loc_id"):
-                ids.add(sl["loc_id"])
-    return ids
 
 
 def payload_summary(payload: dict) -> dict:
@@ -385,7 +361,8 @@ def payload_summary(payload: dict) -> dict:
         "total_stops": total_stops,
         "standalone_assets": len(single),
         "total_locs": total_locs,
-        "will_be_deleted": len(payload.get("_deleted_loc_ids", [])),
+        # `will_be_deleted` is added by the caller from predict_deletions();
+        # it cannot be derived from the payload alone.
     }
 
 
@@ -538,11 +515,41 @@ def stamp_ids_after_push(payload: dict) -> int:
     return stamped
 
 
+@dataclass
+class SyncReport:
+    """Outcome of a ``sync_stamps_from_server()`` run.
+
+    A sync that matches nothing is not a success, and the count of
+    *matched* features alone cannot tell the two apart: the push is a
+    full replacement, so every server LOC left unmatched is a LOC the
+    next push will move to the recycle bin.  The report therefore
+    carries the residual — what did *not* match, and why — so the
+    caller can say so plainly instead of reporting "matched 0" as if it
+    were an accomplishment.
+    """
+
+    matched: int = 0
+    total_server: int = 0
+    #: ``(unique_asset_id, loc_type)`` server records no feature claimed.
+    unmatched_server: List[Tuple[str, str]] = _dc_field(default_factory=list)
+    #: ``(layer_name, reason)`` layers that could not take part at all.
+    layer_notes: List[Tuple[str, str]] = _dc_field(default_factory=list)
+    #: Features whose identity field was empty, so could never match.
+    blank_uid: int = 0
+    #: Features carrying an identity the server has never seen.
+    unknown_uid: int = 0
+
+    @property
+    def ok(self) -> bool:
+        """True when every server record found a feature."""
+        return self.total_server > 0 and not self.unmatched_server
+
+
 def sync_stamps_from_server(
     locs_data: dict,
     location_id: str,
     layer_mappings: List[LayerMapping],
-) -> Tuple[int, int]:
+) -> SyncReport:
     """Match server LOC data to existing QGIS features and write stamp cache.
 
     Fetches ``unique_asset_id`` from each QGIS feature (via its layer mapping)
@@ -550,8 +557,9 @@ def sync_stamps_from_server(
     cache entries populated with the server's IDs and timestamps, so
     subsequent pushes treat them as updates rather than creates.
 
-    Returns ``(matched, total_server)`` — number of features successfully
-    matched and total server LOC count.
+    Returns a :class:`SyncReport`.  Callers must surface
+    ``unmatched_server`` and ``layer_notes`` — see the class docstring for
+    why a bare match count is not enough.
     """
     project = QgsProject.instance()
 
@@ -653,23 +661,29 @@ def sync_stamps_from_server(
             server_index[uid] = entry
             total_server += 1
 
+    report = SyncReport(total_server=total_server)
+
     if not server_index:
         QgsMessageLog.logMessage(
             "Sync: no server LOCs found to match", "LOC Export", Qgis.MessageLevel.Warning,
         )
-        return 0, 0
+        return report
 
     # ------------------------------------------------------------------
     # 2. Walk QGIS features and match by unique_asset_id
     # ------------------------------------------------------------------
-    matched = 0
-    mapping_by_layer = {lm.layer_id: lm for lm in layer_mappings}
+    matched_uids: set = set()
 
     for lm in layer_mappings:
-        if not lm.category_id:
-            continue
         layer = project.mapLayer(lm.layer_id)
         if not isinstance(layer, QgsVectorLayer):
+            continue
+        name = lm.layer_name or layer.name()
+
+        if not lm.category_id:
+            report.layer_notes.append(
+                (name, "not mapped to a LOC category")
+            )
             continue
 
         geom_type = layer.geometryType()
@@ -686,36 +700,239 @@ def sync_stamps_from_server(
             uid_qfield = (lm.qgis_field_for("Unique Asset Identifier")
                           or lm.qgis_field_for("Route ID"))
         if not uid_qfield:
+            # Without an identity field there is nothing to match on, and
+            # nothing the operator can do until they map one — so say which
+            # field is missing rather than skipping in silence.
+            wanted = "Route ID" if is_line else "Unique Asset Identifier"
+            report.layer_notes.append(
+                (name, f"no QGIS field is mapped to '{wanted}'")
+            )
             continue
 
+        n_feats = 0
         for feat in layer.getFeatures():
             if not feat.isValid():
                 continue
+            n_feats += 1
             try:
                 feat_uid = feat.attribute(uid_qfield)
             except (KeyError, RuntimeError):
                 feat_uid = None
-            if not feat_uid or str(feat_uid) == "NULL":
+            if feat_uid is None or str(feat_uid).strip() in ("", "NULL"):
+                report.blank_uid += 1
                 continue
             feat_uid = str(feat_uid).strip()
 
             server_entry = server_index.get(feat_uid)
             if server_entry is None:
+                report.unknown_uid += 1
                 continue
 
             cache_key = _stamp_cache_key(layer, feat.id())
             # Build stamp entry (exclude internal _type marker)
             stamp = {k: v for k, v in server_entry.items() if k != "_type"}
             loc_stamps[cache_key] = stamp
-            matched += 1
+            matched_uids.add(feat_uid)
+            report.matched += 1
+
+        if n_feats == 0:
+            report.layer_notes.append((name, "layer contains no features"))
+
+    # Every server record that no feature claimed is a record the next
+    # push will delete (the server bins whatever the payload omits).
+    for uid, entry in server_index.items():
+        if uid not in matched_uids:
+            report.unmatched_server.append((uid, entry.get("_type", "single")))
+    report.unmatched_server.sort()
 
     _save_stamp_cache(cache)
 
     QgsMessageLog.logMessage(
-        f"Sync: matched {matched} feature(s) to {total_server} server LOC(s)",
+        f"Sync: matched {report.matched} feature(s) to {total_server} "
+        f"server LOC(s); {len(report.unmatched_server)} server LOC(s) "
+        f"unmatched, {report.blank_uid} feature(s) with a blank identity, "
+        f"{report.unknown_uid} feature(s) unknown to the server",
         "LOC Export", Qgis.MessageLevel.Info,
     )
-    return matched, total_server
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Push reconciliation — what would the server delete?
+#
+# The push is a full replacement: `sweepDeletes` on the server bins every
+# LOC in the location the payload does not reference.  The plugin used to
+# predict that from `pulled_loc_ids` — the set remembered from a Pull
+# earlier in the same session — which is wrong in three ways: it is empty
+# when the operator never pulled (so the preview claimed zero deletions
+# while binning the location), it is a stale snapshot that cannot see
+# records added from the web or mobile app since the pull, and it is
+# cleared by a location change or sign-out.
+#
+# These functions instead predict from the location's *live* contents,
+# fetched immediately before the preview.  They mirror the server's
+# matching rules (loc-next `plugin.service.ts`) exactly, because those
+# rules differ per bucket and a loc_id-only comparison would over-report:
+#
+#   single_locs  → matched by unique_asset_id  (applyStandaloneSingle)
+#   dual_locs    → matched by unique_asset_id  (applyStandaloneDual)
+#   multiLocs    → dual origin and each stop matched by loc_id
+#                  (applyRoutedDual / applyRoutedSingle)
+#
+# So a hand-built layer with no loc_id at all still updates the right
+# standalone record, and must not be reported as a delete.
+# ---------------------------------------------------------------------------
+
+def server_loc_index(locs_data: dict) -> Dict[str, Tuple[str, str]]:
+    """Return ``{loc_id: (unique_asset_id, loc_type)}`` for a location.
+
+    Covers every LOC the server holds: standalone singles and duals, plus
+    each route's dual origin and its stop singles.
+    """
+    index: Dict[str, Tuple[str, str]] = {}
+    if not isinstance(locs_data, dict):
+        return index
+
+    for sloc in locs_data.get("singleLOCs", []):
+        lid = sloc.get("loc_id", "")
+        if lid:
+            index[lid] = (sloc.get("unique_asset_id", ""), "single")
+
+    for dloc in locs_data.get("dualLOCs", []):
+        lid = dloc.get("loc_id", "")
+        if lid:
+            index[lid] = (dloc.get("unique_asset_id", ""), "dual")
+
+    for mloc in locs_data.get("multiLoc", []):
+        dual_loc = (mloc.get("dualLoc") or mloc.get("dualLOC")
+                    or mloc.get("dual_loc") or {})
+        lid = dual_loc.get("loc_id", "")
+        if lid:
+            index[lid] = (dual_loc.get("unique_asset_id", ""), "dual")
+        for stop in mloc.get("Stops", mloc.get("stops", [])):
+            sloc = (stop.get("singleLoc") or stop.get("singleLOC")
+                    or stop.get("single_loc") or {})
+            slid = sloc.get("loc_id", "")
+            if slid:
+                index[slid] = (sloc.get("unique_asset_id", ""), "single")
+
+    return index
+
+
+def predict_deletions(
+    payload: dict,
+    locs_data: dict,
+) -> List[Tuple[str, str]]:
+    """Return ``(unique_asset_id, loc_type)`` for LOCs this push would bin.
+
+    Mirrors the server's per-bucket matching (see the section note above)
+    so the prediction matches what ``sweepDeletes`` will actually do.
+    """
+    index = server_loc_index(locs_data)
+    if not index:
+        return []
+
+    # Reverse lookups for the unique_asset_id-matched buckets.  The server
+    # searches by (uniqueAssetId, locType) within the location, so a stop
+    # single is a legitimate match for a standalone single push — index
+    # every LOC of the right type, not just the standalone ones.
+    by_uid: Dict[Tuple[str, str], str] = {}
+    for lid, (uid, ltype) in index.items():
+        if uid:
+            by_uid.setdefault((uid, ltype), lid)
+
+    used: set = set()
+
+    for sl in payload.get("single_locs", []):
+        lid = by_uid.get((sl.get("unique_asset_id", ""), "single"))
+        if lid:
+            used.add(lid)
+
+    for dl in payload.get("dual_locs", []):
+        lid = by_uid.get((dl.get("unique_asset_id", ""), "dual"))
+        if lid:
+            used.add(lid)
+
+    for ml in payload.get("multiLocs", []):
+        dual_loc = ml.get("dualLoc", {})
+        lid = dual_loc.get("loc_id", "") if isinstance(dual_loc, dict) else ""
+        if lid and index.get(lid, ("", ""))[1] == "dual":
+            used.add(lid)
+        for stop in ml.get("Stops", []):
+            sloc = stop.get("singleLoc", {})
+            slid = sloc.get("loc_id", "") if isinstance(sloc, dict) else ""
+            if slid and index.get(slid, ("", ""))[1] == "single":
+                used.add(slid)
+
+    doomed = [
+        (uid or "(no asset ID)", ltype)
+        for lid, (uid, ltype) in index.items()
+        if lid not in used
+    ]
+    doomed.sort()
+    return doomed
+
+
+def audit_export_coverage(
+    layer_mappings: List[LayerMapping],
+    categories: Dict[str, Category],
+) -> List[Tuple[str, int, str]]:
+    """Report mapped layers whose features cannot reach the push payload.
+
+    ``build_payload`` walks layers forward and silently skips any it
+    cannot turn into payload entries — most notably a layer whose
+    category is missing from the category cache, which is what a LOC in
+    the "Uncategorised" group pulls down as (the server sends
+    ``category: null``, so the layer is created with an empty
+    ``category_id``).  Those features are dropped from the payload, and
+    because absence *is* the delete, the server then bins them.
+
+    Returns ``(layer_name, feature_count, reason)`` for each affected
+    layer that actually holds features.
+    """
+    project = QgsProject.instance()
+    problems: List[Tuple[str, int, str]] = []
+
+    for lm in layer_mappings:
+        layer = project.mapLayer(lm.layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+
+        n = layer.featureCount()
+        if n <= 0:
+            continue
+        name = lm.layer_name or layer.name()
+
+        if not lm.enabled_for_export:
+            problems.append(
+                (name, n, "'Create in LOC' is switched off for this layer")
+            )
+            continue
+        if not lm.category_id:
+            problems.append(
+                (name, n, "no LOC category is mapped to this layer")
+            )
+            continue
+
+        cat = categories.get(lm.category_id)
+        if cat is None:
+            problems.append((
+                name, n,
+                "its LOC category no longer exists (assets pulled from the "
+                "Uncategorised group land here). Give them a category in "
+                "LOC, then pull again.",
+            ))
+            continue
+
+        is_point = layer.geometryType() == GEOM_POINT
+        if is_point and not cat.is_single:
+            problems.append((
+                name, n,
+                f"it is a point layer but '{cat.name}' is a dual category, "
+                "so its features are only pushed as route stops",
+            ))
+
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -1128,13 +1345,6 @@ def log_payload_metrics(payload: dict) -> str:
         total_stops += n_stops
         lines.append(f"  Route '{name}': {n_stops} stop(s)")
     lines.append(f"  Total stops: {total_stops}")
-
-    deleted_ids = payload.get("_deleted_loc_ids", [])
-    if deleted_ids:
-        lines.append(
-            f"  Will be deleted on server (absent from payload): "
-            f"{len(deleted_ids)}"
-        )
 
     # Payload size
     payload_bytes = len(_json.dumps(payload, default=str).encode())
