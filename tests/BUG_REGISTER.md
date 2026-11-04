@@ -45,6 +45,12 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
 | 15 | Stop section offered **"Actual Asset Name (required)"** that could not be mapped sensibly from a line layer. | Dead UI: the export never read it — a stop's name and id come from the structure point and the reviewed label (`_stop_identity`). | `ee7a374` | `test_field_combos_follow_category`, `test_injected_essentials_for_bare_categories`, `TestHelpers::test_stop_identity` |
 | 16 | Push fails with **HTTP 500** on real-sized locations. | Server: the `loc-next` API's JSON body limit was body-parser's default 100 KiB, and the 413 was masked as a 500. Fixed server-side (see `issue-doc.md`). Plugin side: 413 handled explicitly, payload size reported on failures. | `ed04c6b` (plugin) | `TestPushFailures::test_gateway_errors_are_hard_failures`, `test_server_500_may_have_committed`, `test_log_payload_metrics` |
 | 17 | Re-push with no edits reported **654 updated LOCs** (Ratoath FTTH, 1.6.0). | Field fingerprint stamped over empty identity values, so every standalone asset was marked changed on every push (see `loc-qgis-push-investigation-debrief.md`, Finding 1). | 1.6.0 debrief fix | `TestStampCache::test_repush_reuses_every_id_and_timestamp`, `TestPush::test_repush_is_a_no_op` |
+| 18 | Fix a Route ID (or structure id) typo after a push → next push **deletes the route and every stop and re-creates them**, losing crew statuses, notes and photos. Same for the original of a copy-pasted structure. (Review finding 1.) | Saved IDs are keyed by the live Route ID / UID value (asset keys, Bug 7), so the edited value found no entry. | `3c01e19` | `TestStampMigration::test_renamed_route_id_keeps_route_and_stops`, `test_renamed_structure_keeps_record`, `test_pasted_duplicate_keeps_the_originals_record` |
+| 19 | New ingress/egress structure on a pulled route: only the **IN** stop is pushed. (Finding 2.) | `_merge_stops` added the inserted IN to its anchor set, so the OUT (same structure) was taken for an existing stop and skipped. | `3c01e19` | `TestReconstructRoutes::test_new_ingress_egress_structure_adds_both_stops` |
+| 20 | A structure drawn exactly onto an existing stop or vertex of a pulled route (enclosure dropped into a vault) **never becomes a stop**. (Finding 3.) | The "position already occupied" filter from Bug 11 applied to every structure, not only pulled ones. | `3c01e19` | `TestReconstructRoutes::test_new_structure_on_an_existing_stop_becomes_a_stop`; the pulled case stays excluded: `TestPulledRoundTrip::test_generate_ignores_colocated_structure_that_is_not_a_stop` |
+| 21 | First push after upgrading from 1.6.x with a Shapefile whose features were renumbered: **route A's saved IDs land on route B**. (Finding 4.) | `_migrate_stamps` trusted the old `layer_source:fid` key without checking the asset name the entry recorded. | `3c01e19` | `TestStampMigration::test_old_sidecar_with_renumbered_fids_follows_assets` |
+| 22 | Move a stop's structure in QGIS, push **without** Generate → the stop is **deleted**; with Generate it is deleted and re-created whenever the route also gained or lost a stop. (Finding 5, worse than reported.) | Reconstruction matched structures to line vertices by current position only, so a moved point no longer matched its vertex; the raw-stop match had no fallback beyond "same count ⇒ same order". | `3c01e19` | `TestPulledRoundTrip::test_moved_stop_without_generate_is_still_a_stop`, `test_moved_stop_keeps_its_record_when_another_stop_is_removed` |
+| 23 | Edit a pulled Route ID → the route is renamed but its stops keep `<old route>_<structure>` identities. (Finding 6.) | Pulled stops keep the server identity unless renamed in Route Review; the route part was never re-derived. | `3c01e19` | `TestPulledRoundTrip::test_renamed_route_id_renames_its_stops` |
 
 ## Behaviour that looks like a bug but is correct
 
@@ -54,6 +60,8 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
 | Adding one stop shows **Created LOCs 2, Created Stops 1**. | The structure's standalone single LOC plus the stop's own single-LOC label are two records. | `TestPulledRoundTrip::test_added_stop_is_created` |
 | Pull on a location with no LOC data does nothing. | The Pull dialog says "No LOC data found" and keeps Import disabled, so an empty pull cannot wipe an existing mapping. | `TestPullDialog::test_empty_location` |
 | After a pull, a stop field that the **cable** category lacks stays unmapped (e.g. stop Colour on a Duct route). | The pulled line layer only has the cable category's columns; there is nothing to map it onto. Existing stops keep their server values regardless. | `test_auto_mapping_line_stop_fields` (Pole stop fields on a Fiber Cable layer) |
+| The stop section of Category Mapping shows only **Colour** (USA locations) or nothing at all. | It lists the stop category's own fields; LOC defines "Stops" with one field. Name and ID come from the structure point and Route Review (`_stop_identity`); the old "Actual Asset Name (required)" row was never read (Bug 15). A grey hint says so. | `test_field_combos_follow_category`, `test_injected_essentials_for_bare_categories` |
+| Renaming a structure's id after a push shows **Updated LOCs 1** for it. | The id is part of the record, so the server must learn it; only that record's `updatedAt` moves. | `TestStampMigration::test_renamed_structure_keeps_record` |
 | An unedited pull → push on a location whose records hold the identity fields only shows **0 / 0** but a first push after upgrading from 1.6.0 bumps every standalone asset once. | Old sidecar files hold the pre-fix fingerprint; the next push rewrites it and then settles. | `TestStampMigration::test_old_sidecar_upgraded_in_place` |
 
 ## Verified on real servers (2 Nov 2026, build `ee7a374` / `caf861c`)
@@ -65,7 +73,7 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
 | Live scenarios with pushes on staging Socorro | 10 / 10 passed |
 | Continuous edit chain on staging Mondovi: pull → push → edit → push → edit again → push → pull into a new project → push → revert → push → pull → push | every unedited push 0 / 0, every edit exactly 1 updated, server identical to the backup at the end (ignoring the edited record's `updatedAt`); same chain plus delete on the fake server in `TestEditCycles::test_push_edit_push_pull_edit_pull_delete_chain` |
 | Production Socorro, Torrington, Spencer, Mondovi re-read after the staging pushes | unchanged |
-| Full suite | 357 passed, 96.3 % branch coverage; 10 / 10 bug videos |
+| Full suite (4 Nov, `3c01e19`) | 367 passed, 96.3 % branch coverage; 10 / 10 bug videos |
 
 ## Open / not reproduced
 
@@ -79,6 +87,15 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
   `tests/run_live_videos.sh` (read-only).
 - **Server counts renumbered stops as updates** (see above). Whether LOC
   should treat a pure renumbering as a change is a server-side decision.
+- **UI-thread layer scans** (review finding 7): `set_layer_mappings`,
+  `_migrate_stamps` and `_stamp_cache_key` walk every mapped layer on
+  mapping accept, pull, push and sync, with a `getFeature` per feature on
+  first lookup. Fine on memory/GPKG layers of a few thousand features; not
+  measured on PostGIS/WFS. Not a correctness issue — left as is.
+- **Base**: every fix build so far forks from the 31 Jul 1.6.2 code
+  (`cfd0fbe`). The released 1.6.3 (`origin/fix/workspace-project-grouping`)
+  and 1.7.0 (not in git yet) must be merged in before a build can ship as
+  an update — see the 4 Nov fix-build review.
 
 ## Backups used
 
