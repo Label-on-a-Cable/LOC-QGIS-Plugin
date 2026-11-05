@@ -111,9 +111,9 @@ class PushPreviewDialog(QDialog):
             del_label = QLabel(str(deleted))
             del_label.setStyleSheet("color: #c0392b; font-weight: bold;")
             del_label.setToolTip(
-                "LOCs that were pulled from this location but are no "
-                "longer in the data being pushed. The push is a full "
-                "replacement — the server will delete them."
+                "LOCs currently on the server that this push does not "
+                "contain. The push is a full replacement — the server "
+                "will move them to the recycle bin."
             )
             local_layout.addRow("Will be deleted on server:", del_label)
         root.addWidget(local_group)

@@ -55,8 +55,14 @@ class LabelOnACablePlugin:
         self._routes_snap_tolerance = None
 
         # Pull / import state
-        self._pulled_loc_ids = set()  # Set[str] for delete tracking
+        self._pulled_loc_ids = set()  # Set[str], used to pick the route
+                                      # reconstruction path on regenerate
         self._pulled_multi_stop_counts = {}  # {multi_id: stop_count}
+
+        # Live server snapshot fetched at the start of a push so the
+        # preview can predict deletions from what is actually on the
+        # server rather than from what a Pull happened to remember.
+        self._push_state_task = None
 
     _SNAP_TOLERANCE_KEY = "LOC/snap_tolerance"
 
@@ -621,12 +627,78 @@ class LabelOnACablePlugin:
             )
             return
 
+        # Fetch the location's live contents before previewing.  The push
+        # is a full replacement, and only the server knows what is
+        # currently in the location — anything added from the web or
+        # mobile app since the last Pull included.
+        if self._push_state_task is not None:
+            return  # a push is already being prepared
+
+        from qgis.core import QgsApplication
+        from .core.tasks import FetchLocsTask
+
+        self._push_state_task = FetchLocsTask(
+            self.api, self.active_location.location_id,
+        )
+        self._push_state_task.taskCompleted.connect(self._on_push_state_fetched)
+        self._push_state_task.taskTerminated.connect(self._on_push_state_failed)
+        QgsApplication.taskManager().addTask(self._push_state_task)
+        self.iface.messageBar().pushInfo(
+            self.PLUGIN_NAME, "Checking current LOC contents...",
+        )
+
+    def _on_push_state_failed(self):
+        """Live-state fetch failed — refuse to push blind."""
+        task = self._push_state_task
+        self._push_state_task = None
+        msg = (task.error if task else None) or "Unknown error"
+        QMessageBox.critical(
+            self.iface.mainWindow(),
+            "Push Cancelled",
+            "Could not read the current contents of this location from "
+            f"LOC:\n\n{msg}\n\n"
+            "The push is a full replacement, so pushing without knowing "
+            "what is on the server risks deleting assets. Check your "
+            "connection and try again.",
+        )
+
+    def _on_push_state_fetched(self):
+        """Build payload, reconcile against live server state, preview."""
+        task = self._push_state_task
+        self._push_state_task = None
+        if task is None:
+            return
+        server_locs = task.locs_data or {}
+
         from qgis.core import Qgis, QgsMessageLog
         from .core.export_builder import (
-            build_payload, log_payload_metrics, payload_summary,
+            audit_export_coverage, build_payload, log_payload_metrics,
+            payload_summary, predict_deletions, server_loc_index,
             validate_payload,
         )
         from .ui.push_preview_dialog import PushPreviewDialog
+        from .ui.reconcile_dialog import (
+            confirm_deletions, confirm_dropped_layers,
+        )
+
+        # The same fetch carries the location's categories, so refresh the
+        # cache the audit below is about to consult.  Left stale, a
+        # category renamed or removed since the mapping dialog was last
+        # opened reads as "missing" and its features are dropped.
+        if task.categories:
+            self._categories_cache = {
+                c.category_id: c for c in task.categories
+            }
+
+        # Layers whose features cannot reach the payload at all — most
+        # often a category the cache has no entry for, which is what LOCs
+        # from the Uncategorised group pull down as.  Without this they
+        # are dropped in silence and then binned by the sweep below.
+        problems = audit_export_coverage(
+            self.layer_mappings, self._categories_cache,
+        )
+        if not confirm_dropped_layers(self.iface.mainWindow(), problems):
+            return
 
         payload = build_payload(
             routes=self.cached_routes,
@@ -635,30 +707,14 @@ class LabelOnACablePlugin:
             location=self.active_location,
             user_id=self.auth.current_user.user_id,
             organization_id=self.auth.current_user.organization.org_id,
-            pulled_loc_ids=self._pulled_loc_ids or None,
         )
 
-        # --- Warn if disabled layers could cause server-side deletion ---
-        disabled_names = [
-            lm.layer_name for lm in self.layer_mappings
-            if not lm.enabled_for_export and lm.category_id
-        ]
-        if disabled_names:
-            layer_list = "\n".join(f"  - {n}" for n in disabled_names)
-            reply = QMessageBox.warning(
-                self.iface.mainWindow(),
-                "Disabled Layers Will Be Removed from LOC",
-                "The following layers have 'Create in LOC' disabled:\n\n"
-                f"{layer_list}\n\n"
-                "Because the push is a full replacement, any LOCs "
-                "previously pushed for these layers will be DELETED "
-                "from the server.\n\n"
-                "Continue?",
-                MB_YES | MB_NO,
-                MB_NO,
-            )
-            if reply != MB_YES:
-                return
+        # Disabled layers used to get their own warning here.  It fired on
+        # every disabled layer whether or not it held features or had ever
+        # reached LOC, and `audit_export_coverage` above now covers the
+        # same ground precisely — while `confirm_deletions` below names the
+        # assets actually at risk.  Three dialogs saying the same thing is
+        # how the one that matters gets clicked through.
 
         # --- Instrumentation: log metrics before push ---
         metrics = log_payload_metrics(payload)
@@ -714,12 +770,28 @@ class LabelOnACablePlugin:
             if reply != MB_YES:
                 return
 
+        # Predict deletions from the live snapshot, mirroring the
+        # server's per-bucket matching rules.
+        doomed = predict_deletions(payload, server_locs)
+        total_server = len(server_loc_index(server_locs))
+        if doomed:
+            QgsMessageLog.logMessage(
+                "Push would delete "
+                + ", ".join(f"{uid} ({ltype})" for uid, ltype in doomed),
+                "LOC Push", Qgis.MessageLevel.Warning,
+            )
+        if not confirm_deletions(
+            self.iface.mainWindow(), doomed, total_server,
+        ):
+            return
+
         summary = payload_summary(payload)
         # Routes that matched no structures push with line-endpoint
         # coordinates — surface this so the operator confirms knowingly.
         summary["routes_unmatched"] = sum(
             1 for r in self.cached_routes if r.is_unmatched
         )
+        summary["will_be_deleted"] = len(doomed)
 
         dlg = PushPreviewDialog(
             api_client=self.api,
@@ -923,17 +995,31 @@ class LabelOnACablePlugin:
             return
 
         from .core.export_builder import sync_stamps_from_server
+        from .ui.reconcile_dialog import show_sync_report
 
-        matched, total = sync_stamps_from_server(
+        report = sync_stamps_from_server(
             task.locs_data,
             self.active_location.location_id,
             self.layer_mappings,
         )
-        self.iface.messageBar().pushSuccess(
-            self.PLUGIN_NAME,
-            f"Sync complete: matched {matched} feature(s) "
-            f"to {total} server LOC(s).",
-        )
+
+        # A bare "matched N" reads as success even when N is 0 and every
+        # server LOC is queued for deletion, so the residual gets a modal
+        # rather than a message-bar line.
+        show_sync_report(self.iface.mainWindow(), report)
+
+        if report.ok:
+            self.iface.messageBar().pushSuccess(
+                self.PLUGIN_NAME,
+                f"Sync complete: matched {report.matched} feature(s) "
+                f"to {report.total_server} server LOC(s).",
+            )
+        else:
+            self.iface.messageBar().pushWarning(
+                self.PLUGIN_NAME,
+                f"Sync matched {report.matched} of {report.total_server} "
+                f"server LOC(s) — {len(report.unmatched_server)} unmatched.",
+            )
 
     def _on_sync_failed(self):
         """Handle failed sync fetch."""
