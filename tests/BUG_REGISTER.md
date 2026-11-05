@@ -51,6 +51,10 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
 | 21 | First push after upgrading from 1.6.x with a Shapefile whose features were renumbered: **route A's saved IDs land on route B**. (Finding 4.) | `_migrate_stamps` trusted the old `layer_source:fid` key without checking the asset name the entry recorded. | `3c01e19` | `TestStampMigration::test_old_sidecar_with_renumbered_fids_follows_assets` |
 | 22 | Move a stop's structure in QGIS, push **without** Generate → the stop is **deleted**; with Generate it is deleted and re-created whenever the route also gained or lost a stop. (Finding 5, worse than reported.) | Reconstruction matched structures to line vertices by current position only, so a moved point no longer matched its vertex; the raw-stop match had no fallback beyond "same count ⇒ same order". | `3c01e19` | `TestPulledRoundTrip::test_moved_stop_without_generate_is_still_a_stop`, `test_moved_stop_keeps_its_record_when_another_stop_is_removed` |
 | 23 | Edit a pulled Route ID → the route is renamed but its stops keep `<old route>_<structure>` identities. (Finding 6.) | Pulled stops keep the server identity unless renamed in Route Review; the route part was never re-derived. | `3c01e19` | `TestPulledRoundTrip::test_renamed_route_id_renames_its_stops` |
+| 24 | Unedited pull → push **blanks or overwrites a category field** (Tempe Blue Light Stanch, staging Arizona: Zone "Zone 5" would become "N/A" on 17 records). | Records holding both the named key and a stale `field_N` copy in `fields`; the pull let the numbered copy win. | 1.7.1 | `TestPulledRoundTrip::test_stale_numbered_field_does_not_replace_the_named_value` |
+| 25 | Unedited pull → push turns a route into a **plain cable and bins its stops** when a stop was added in the LOC app straight onto the cable (no structure there). Reshaping such a cable had the same effect. | Reconstruction finds stops through structure points; a stop without one was treated as "structure deleted", and matched to its server record by list position only. Now kept as a server-only stop (shown in Route Review, can be renamed or removed), found by coordinate when the line was reshaped. | 1.7.1 | `TestPulledRoundTrip::test_stop_without_a_structure_survives_the_round_trip`, `_survives_a_reshaped_cable`, `_can_be_removed_or_renamed_in_review`, `test_deleted_structure_still_removes_its_stop` |
+| 26 | Unedited pull → push reports **1 updated LOC per cable with no destination name** (Metro Fiber Ring FC-005, FC-009). | A null `destination` was written back as an empty string. | 1.7.1 | `TestPulledRoundTrip::test_null_destination_name_stays_null` |
+| 27 | Unedited pull → push **renames a route** whose name differs from its cable's asset id (always the case after a Route ID correction, see below): 1 updated multi-LOC on every push. | The payload always set `multiName` to the Route ID column, which shows the asset id. Now only an edited Route ID renames the route. | 1.7.1 | `TestPulledRoundTrip::test_route_name_differing_from_asset_id_is_kept` |
 
 ## Behaviour that looks like a bug but is correct
 
@@ -61,9 +65,11 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
 | Pull on a location with no LOC data does nothing. | The Pull dialog says "No LOC data found" and keeps Import disabled, so an empty pull cannot wipe an existing mapping. | `TestPullDialog::test_empty_location` |
 | After a pull, a stop field that the **cable** category lacks stays unmapped (e.g. stop Colour on a Duct route). | The pulled line layer only has the cable category's columns; there is nothing to map it onto. Existing stops keep their server values regardless. | `test_auto_mapping_line_stop_fields` (Pole stop fields on a Fiber Cable layer) |
 | The stop section of Category Mapping shows only **Colour** (USA locations) or nothing at all. | It lists the stop category's own fields; LOC defines "Stops" with one field. Name and ID come from the structure point and Route Review (`_stop_identity`); the old "Actual Asset Name (required)" row was never read (Bug 15). A grey hint says so. | `test_field_combos_follow_category`, `test_injected_essentials_for_bare_categories` |
-| Renaming a **standalone** structure's id after a push shows **Created 1 / Deleted 1**, after a "LOCs Will Be Deleted" prompt naming the old id. | LOC matches standalone singles and duals by asset id, not `loc_id` (staging dry run, 5 Nov 2026: renamed standalone single → 1 created; renamed route or stop → 0 created). The plugin still sends the saved `loc_id`, but only the server can keep the record. Routes and stops are matched by `loc_id` and are updated in place (Bug 18). | `TestPush::test_renamed_standalone_structure_warns_before_replacing_it`, `TestStampMigration::test_renamed_structure_keeps_record` (payload side) |
+| Renaming a **standalone** structure's id after a push shows **Created 1 / Deleted 1**, after a "LOCs Will Be Deleted" prompt naming the old id. | LOC matches standalone singles and duals by asset id, not `loc_id` (staging dry run, 5 Nov 2026: renamed standalone single → 1 created; renamed route or stop → 0 created). The plugin still sends the saved `loc_id`, but only the server can keep the record. Routes and stops are matched by `loc_id` and keep their records (Bug 18). | `TestPush::test_renamed_standalone_structure_warns_before_replacing_it`, `TestStampMigration::test_renamed_structure_keeps_record` (payload side) |
 | Push shows "Checking current LOC contents..." before the preview, and sometimes a "Features Excluded From Push" or "LOCs Will Be Deleted" prompt. | 1.7.0: the location is read first so deletions are predicted from what LOC holds now, not from the last pull. | `TestPushGuards::test_disabled_layer_warning`, `TestPull::test_delete_after_pull_warns_and_deletes`, `TestAuditExportCoverage`, `tests/test_reconcile.py` |
 | An unedited pull → push on a location whose records hold the identity fields only shows **0 / 0** but a first push after upgrading from 1.6.0 bumps every standalone asset once. | Old sidecar files hold the pre-fix fingerprint; the next push rewrites it and then settles. | `TestStampMigration::test_old_sidecar_upgraded_in_place` |
+
+| After correcting a **Route ID**, LOC shows the new route name but the cable and its existing stops keep the old asset ids; a fresh pull shows the old Route ID again. | Server-side (staging, 5 Nov 2026, locked and unlocked routes): for a routed cable and its stops LOC applies only `multiName`; `unique_asset_id` of existing records is not changed (dry run: 1 updated multi-LOC, 0 updated LOCs). Nothing is deleted or re-created (Bug 18), and stops added afterwards take the new prefix. | `TestStampMigration::test_renamed_route_id_keeps_route_and_stops` (payload side); staging chain step 9 |
 
 ## Verified on real servers (2 Nov 2026, build `ee7a374` / `caf861c`)
 
@@ -77,6 +83,11 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
 | Full suite (4 Nov, `3c01e19`) | 367 passed, 96.3 % branch coverage; 10 / 10 bug videos |
 | Full suite (5 Nov, 1.7.1 = fixes merged onto 1.7.0 `8d5e1b3`) | 401 passed, 7 skipped (stub-only twins of `TestAuditExportCoverage`), 96.0 % branch coverage; 10 / 10 bug videos; `python -m unittest test_reconcile test_grouping` 25 OK |
 | Staging USA › Socorro, 5 Nov, dry runs only: unchanged payload, then one record renamed per kind | unchanged 0 / 0; standalone single renamed → 1 created (plugin predicts the old id deleted); routed dual renamed → 0 created; route stop renamed → 0 created |
+| Staging **Arizona** account, 5 Nov, all 8 locations, read-only: unedited pull → dry run under EPSG:4326 (with and without Generate), 3857, 26912 | `Tempe Campus › test`, `Metro Fiber Ring`, `Tempe Blue Light Stanch`: 0 / 0, no deletions predicted (after Bugs 24–27). The other five are held back only by uncategorised routes (see Open) |
+| Staging `Tempe Campus › test`, real pushes, 16-step chain: pull → push → field edit ×2 → route field → move structure → move stop without Generate → Route ID correction → new project → add / rename / delete structures and a stop → revert → pull → push | 19 / 19 checks; every unedited push 0 / 0; server identical to the backup at the end |
+| Staging `Metro Fiber Ring`, real pushes, EPSG:3857 project: standalone cable renamed and moved, route with a structure-less stop edited and reshaped, revert | 11 / 11 checks; server identical to the backup at the end |
+| Live UI scenarios with pushes on staging `Tempe Campus › test` | 10 / 10 passed |
+| Full suite (5 Nov, after Bugs 24–27) | 408 passed, 7 skipped, 96.0 % branch coverage |
 
 ## Open / not reproduced
 
@@ -102,11 +113,23 @@ Titles in *italics* are the recorded scenarios in `tests/test_bug_videos.py`
   but cannot prevent it; matching on `loc_id` when the payload carries
   one would need a change in `loc-next` (`applyStandaloneSingle` /
   `applyStandaloneDual`).
+- **Routes and structures without a category are not pulled** (staging
+  Arizona: 5 of 8 locations). A route whose cable has no category is
+  skipped on pull, an uncategorised structure lands in a "None (LOC)"
+  layer that is excluded from push — so the next push would delete them.
+  The 1.7.0 prompts ("Features Excluded From Push", "LOCs Will Be
+  Deleted") are the only guard. A dry run shows LOC accepts such records
+  back unchanged, so passing them through untouched is possible; needs a
+  decision.
+- **A Route ID correction reaches only the route name** (server-side,
+  see the table above). After a fresh pull the route name can no longer
+  be set back to equal the asset id from QGIS, because the Route ID column
+  shows the asset id (Bug 27 keeps the differing name).
 - **Base**: resolved. 1.6.3 and 1.7.0 (`origin/main` `8d5e1b3`) are merged
   into the fix branch; 1.7.1 is the first fix build on that base.
 
 ## Backups used
 
 `tests/reports/videos/live/backups/` (ignored by git): `prod_usa/*` (production,
-read-only), `staging_usa/*` (before/after every staging push),
+read-only), `staging_usa/*`, `staging_arizona/*` (before/after every staging push),
 `ftth_project-*.json`, `prod_test_ftth-*.json`.

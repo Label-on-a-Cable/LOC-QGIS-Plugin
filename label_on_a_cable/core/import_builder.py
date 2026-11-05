@@ -52,7 +52,7 @@ _POINT_ESSENTIAL = ["_loc_id", "_origin_id", "_origin_lon", "_origin_lat",
                     "_sloc_json",
                     "Unique Asset Identifier", "Actual Asset Name"]
 _LINE_ESSENTIAL = ["_loc_id", "_origin_id", "_dest_id", "_multi_id",
-                   "_stop_ids", "_stop_loc_ids",
+                   "_stop_ids", "_stop_loc_ids", "_free_stops",
                    "_origin_lon", "_origin_lat", "_dest_lon", "_dest_lat",
                    "_dloc_json", "_mloc_json",
                    "Route ID", "Actual Asset Name", "Destination"]
@@ -69,26 +69,17 @@ _DUAL_DEST_KNOWN = {"destination"}
 # ------------------------------------------------------------------
 
 def extract_multi_stop_counts(locs_data: dict) -> Dict[str, int]:
-    """Count multiLoc stops consistent with reconstruction ghost-stop rules.
+    """Count the multiLoc stops ``reconstruct_routes()`` will produce.
 
-    Reconstruction drops "ghost stops" — stops whose singleLoc coordinates
-    don't match any standalone singleLOC (which become the point features
-    in the QGIS point layer).  This function applies the same filtering
-    using only the raw API data, so the expected count matches what
-    ``reconstruct_routes()`` will actually produce.
+    Every stop with a position becomes a vertex of the pulled line and
+    a stop of the reconstructed route — on its structure point, or as a
+    server-only stop where LOC holds none there (``_free_stops``).  Stops
+    without a position are not on the line and are not counted.
 
-    Returns ``{multiLoc_id: matched_stop_count}``.
+    Returns ``{multiLoc_id: stop_count}``.
     """
     if not isinstance(locs_data, dict):
         return {}
-
-    # Build set of all standalone singleLOC coordinates (8dp ≈ 1 mm)
-    single_coords: set = set()
-    for sloc in locs_data.get("singleLOCs", []):
-        lon = _float(sloc.get("origin_longitude", 0))
-        lat = _float(sloc.get("origin_latitude", 0))
-        if lon != 0 or lat != 0:
-            single_coords.add((round(lon, 8), round(lat, 8)))
 
     result: Dict[str, int] = {}
     for mloc in locs_data.get("multiLoc", []):
@@ -107,9 +98,7 @@ def extract_multi_stop_counts(locs_data: dict) -> Dict[str, int]:
             lat = _float(sloc.get("origin_latitude", 0))
             if lon == 0 and lat == 0:
                 continue
-            coord = (round(lon, 8), round(lat, 8))
-            if coord in single_coords:
-                count += 1
+            count += 1
         result[multi_id] = count
 
     return result
@@ -158,12 +147,18 @@ def build_layers(
         dl = first.get("dualLoc") or first.get("dualLOC") or {}
         _log(f"First multiLoc dualLoc keys: {list(dl.keys()) if isinstance(dl, dict) else type(dl)}")
 
+    # Where LOC holds a structure.  A route stop anywhere else has no
+    # point feature to stand on after the pull (see ``_free_stops``).
+    structure_keys: Set[Tuple[float, float]] = set()
+
     # --- Parse singleLOCs ---
     for sloc in locs_data.get("singleLOCs", []):
         cat_id = sloc.get("category", sloc.get("category_id", ""))
         loc_id = sloc.get("loc_id", "")
         if loc_id:
             pulled_ids.add(loc_id)
+        structure_keys.add((round(_float(sloc.get("origin_longitude", 0)), 8),
+                            round(_float(sloc.get("origin_latitude", 0)), 8)))
 
         cat = cat_lookup.get(cat_id)
         cat_name = cat.name if cat else cat_id
@@ -258,6 +253,7 @@ def build_layers(
         # Also build a coord→ID map stored on the line feature so the
         # export builder can reuse original server IDs on round-trip.
         stop_loc_parts: list = []
+        free_stop_ids: list = []
         for stop_entry in sorted(
             stops, key=lambda s: s.get("stopNumber", 0)
         ):
@@ -284,8 +280,16 @@ def build_layers(
                     f"={sloc_id},{sloc_origin}"
                     f",{exact_lon},{exact_lat}"
                 )
+                if (round(s_lon, 8), round(s_lat, 8)) not in structure_keys:
+                    free_stop_ids.append(sloc_id)
         if stop_loc_parts:
             feat.setAttribute("_stop_loc_ids", "|".join(stop_loc_parts))
+        # Stops LOC holds where it has no structure — added in the LOC app
+        # straight onto the cable.  Reconstruction finds stops through
+        # their structure points, so without this note they would look
+        # like stops whose structure was deleted and drop out of the push.
+        if free_stop_ids:
+            feat.setAttribute("_free_stops", ",".join(free_stop_ids))
 
     # --- Create memory layers ---
     layers: List[QgsVectorLayer] = []
@@ -542,6 +546,13 @@ def reconstruct_routes(
             # enclosure inside a handhole, say) they tell us which of the
             # co-located point features each stop really is.
             raw_stops = _raw_stop_info(feat, len(vertices) - 2) if multi_id else []
+            free_ids = {i for i in _safe_feat_attr(feat, "_free_stops").split(",") if i}
+            free_at: Dict[Tuple[float, float], List[dict]] = {}
+            free_used: Set[str] = set()
+            if free_ids:
+                for info in _raw_stop_info(feat, None):
+                    if info["loc_id"] in free_ids:
+                        free_at.setdefault(info["key"], []).append(info)
 
             # --- Origin = first vertex ---
             o_key = (round(vertices[0].x(), 8), round(vertices[0].y(), 8))
@@ -596,8 +607,32 @@ def reconstruct_routes(
                         for info in infos
                     ]
                     if not matches[0]:
+                        # No structure here.  A stop LOC never had a
+                        # structure for stays on the route as it is; any
+                        # other is a stop whose structure was deleted.
+                        # A reshaped line no longer lines up with the
+                        # server stops by position in the list, so fall
+                        # back to the stop's own coordinate.
+                        here = [i for i in infos
+                                if i and i.get("loc_id") in free_ids]
+                        if not here and free_ids:
+                            here = free_at.get(key, [])[:run]
+                        for info in here:
+                            if info["loc_id"] in free_used:
+                                continue
+                            free_used.add(info["loc_id"])
+                            stop_num += 1
+                            label = info.get("name") or info.get("uid") or ""
+                            stops.append(Stop(
+                                original_name=label,
+                                structure_name=label,
+                                stop_type=_stop_type_from_name(
+                                    label, StopType.PASSTHROUGH),
+                                stop_number=stop_num,
+                                server_loc_id=info["loc_id"],
+                            ))
                         v_idx += run
-                        continue  # no matching structure — skip
+                        continue
 
                     # Consecutive vertices on the same structure form one
                     # group (one stop number): 1 → passthrough;
@@ -995,7 +1030,7 @@ def _stop_type_from_name(name: str, default: StopType) -> StopType:
     return default
 
 
-def _raw_stop_info(feat: QgsFeature, n_vertices: int) -> List[dict]:
+def _raw_stop_info(feat: QgsFeature, n_vertices: Optional[int]) -> List[dict]:
     """Server stop identities (``uid``, ``name``) in polyline-vertex order.
 
     Mirrors ``_sorted_stop_coords`` (sorted by stopNumber, stops without
@@ -1018,10 +1053,15 @@ def _raw_stop_info(feat: QgsFeature, n_vertices: int) -> List[dict]:
                        key=lambda s: s.get("stopNumber", 0)):
         sloc = (stop.get("singleLoc") or stop.get("singleLOC")
                 or stop.get("single_loc") or {})
-        if _float(sloc.get("origin_longitude", 0)) or _float(sloc.get("origin_latitude", 0)):
+        lon = _float(sloc.get("origin_longitude", 0))
+        lat = _float(sloc.get("origin_latitude", 0))
+        if lon or lat:
             uids.append({"uid": str(sloc.get("unique_asset_id") or ""),
-                         "name": str(sloc.get("actual_asset_name") or "")})
-    return uids if len(uids) == n_vertices else []
+                         "name": str(sloc.get("actual_asset_name") or ""),
+                         "loc_id": str(sloc.get("loc_id") or ""),
+                         "key": (round(lon, 8), round(lat, 8))})
+    # n_vertices None: the caller matches by coordinate, not position
+    return uids if n_vertices is None or len(uids) == n_vertices else []
 
 
 def _safe_feat_attr(feat: QgsFeature, field_name: str) -> str:
@@ -1244,6 +1284,11 @@ def _populate_numbered_fields(
             # Try field_N -> real name mapping first
             real_name = fmap.get(key, "")
             if real_name and real_name in extra_field_names:
+                # Older records keep stale field_N entries next to the
+                # named ones ({"Zone": "Zone 5", "field_3": "N/A"}).  The
+                # named key is the live value; a leftover must not replace it.
+                if real_name in fields_dict:
+                    continue
                 if val:
                     feat.setAttribute(real_name, _clean_val(val))
                 continue

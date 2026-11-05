@@ -232,12 +232,14 @@ class TestSummaries:
         data = pulled[3]
         mid = data["multiLoc"][0]["id"]
         assert ib.extract_multi_stop_counts(data) == {mid: 4}
-        # ghost stop: coordinate not present among standalone singles
+        # a stop with no structure under it is still a stop of the route
+        # (kept as a server-only stop since 1.7.1) ...
         data["multiLoc"][0]["Stops"][0]["singleLoc"]["origin_longitude"] = 1.0
         data["multiLoc"].append({"Stops": []})                 # no id → skipped
+        # ... a stop with no position is not on the line at all
         data["multiLoc"].append({"_id": "x", "stops": [
             {"singleLOC": {"origin_longitude": 0, "origin_latitude": 0}}]})
-        assert ib.extract_multi_stop_counts(data) == {mid: 3, "x": 0}
+        assert ib.extract_multi_stop_counts(data) == {mid: 4, "x": 0}
         assert ib.extract_multi_stop_counts("nope") == {}
 
 

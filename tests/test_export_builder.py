@@ -1139,6 +1139,134 @@ class TestPulledRoundTrip:
         assert [s["singleLoc"]["loc_id"] for s in m["Stops"]] == list(raw)
         assert payload["_test_doomed"] == []
 
+    # --- Seen on staging › Arizona (5 Nov 2026) ---------------------------
+
+    def test_stale_numbered_field_does_not_replace_the_named_value(self, tmp_path):
+        """Tempe Blue Light: records hold {"Zone": "Zone 5", ..., "field_3":
+        "N/A"}.  The leftover field_3 was read as Zone, blanked it, and the
+        push wrote "N/A" over "Zone 5" on every stanchion."""
+        def mutate(data):
+            for s in data["singleLOCs"]:
+                s["fields"] = {**s["fields"], "field_1": "N/A", "field_2": "N/A"}
+        p = pulled_network(tmp_path, mutate)
+        payload = build_pulled(p)
+        src = {s["loc_id"]: s for s in p.data["singleLOCs"]}
+        assert any(v not in ("", "N/A") for s in src.values() for v in s["fields"].values())
+        for s in payload["single_locs"]:
+            a, orig = s["attributes"], src[s["attributes"]["loc_id"]]
+            assert a["fields"] == orig["fields"]
+            assert a["updatedAt"] == orig["updatedAt"]
+
+    @staticmethod
+    def _without_structure_under_first_stop(data):
+        """Make stop 1 a stop LOC holds with no structure under it."""
+        sl = data["multiLoc"][0]["Stops"][0]["singleLoc"]
+        at = (sl["origin_longitude"], sl["origin_latitude"])
+        data["singleLOCs"] = [s for s in data["singleLOCs"]
+                              if (s["origin_longitude"], s["origin_latitude"]) != at]
+
+    def test_stop_without_a_structure_survives_the_round_trip(self, tmp_path):
+        """Metro Fiber Ring: stops added in the LOC app straight onto the
+        cable have no structure point.  They vanished from the route on
+        pull, so the push turned the route into a plain cable and binned
+        its stops."""
+        p = pulled_network(tmp_path, self._without_structure_under_first_stop)
+        raw = p.data["multiLoc"][0]
+        for routes in (ib.reconstruct_routes(p.maps, skip_snapping=True),
+                       ib.reconstruct_routes(p.maps, snap_tolerance=1.0)):
+            r = [r for r in routes if r.line_name == "CBL-001"][0]
+            assert r.active_stop_count == len(raw["Stops"])
+            first = r.intermediate_stops[0]
+            assert first.is_server_only
+            assert first.display_name == raw["Stops"][0]["singleLoc"]["actual_asset_name"]
+            payload = build_pulled(p, routes)
+            assert payload["_test_doomed"] == []
+            assert payload["multiLocs"][0]["Stops"] == raw["Stops"]
+            assert eb.validate_payload(
+                payload, ib.extract_multi_stop_counts(p.data), True) == []
+
+    def test_stop_without_a_structure_survives_a_reshaped_cable(self, tmp_path):
+        """Metro Fiber Ring FC-001 (staging, 5 Nov 2026): adding a bend to
+        the cable shifted the vertex list, the stop no longer lined up
+        with its server record and dropped out of the route."""
+        p = pulled_network(tmp_path, self._without_structure_under_first_stop)
+        raw = p.data["multiLoc"][0]
+        cables = p.layers["Fiber Cable (LOC)"]
+        f = feature_where(cables, "Route ID", "CBL-001")
+        pts = f.geometry().asPolyline()
+        bend = QgsPointXY((pts[0].x() + pts[1].x()) / 2 + 1e-5,
+                          (pts[0].y() + pts[1].y()) / 2 + 1e-5)
+        cables.dataProvider().changeGeometryValues(
+            {f.id(): QgsGeometry.fromPolylineXY([pts[0], bend] + pts[1:])})
+        routes = ib.reconstruct_routes(p.maps, skip_snapping=True)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        assert r.active_stop_count == len(raw["Stops"])
+        payload = build_pulled(p, routes)
+        assert payload["_test_doomed"] == []
+        assert ([s["singleLoc"]["loc_id"] for s in payload["multiLocs"][0]["Stops"]]
+                == [s["singleLoc"]["loc_id"] for s in raw["Stops"]])
+
+    def test_stop_without_a_structure_can_be_removed_or_renamed_in_review(self, tmp_path):
+        p = pulled_network(tmp_path, self._without_structure_under_first_stop)
+        raw = p.data["multiLoc"][0]["Stops"]
+        routes = ib.reconstruct_routes(p.maps, skip_snapping=True)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        r.intermediate_stops[0].display_name = "Splice A"
+        sl = build_pulled(p, routes)["multiLocs"][0]["Stops"][0]["singleLoc"]
+        assert (sl["loc_id"], sl["actual_asset_name"]) == (raw[0]["singleLoc"]["loc_id"], "Splice A")
+        r.stops[1].removed = True
+        payload = build_pulled(p, routes)
+        assert [s["singleLoc"]["loc_id"] for s in payload["multiLocs"][0]["Stops"]] == \
+            [s["singleLoc"]["loc_id"] for s in raw[1:]]
+        assert payload["_test_doomed"] == [(raw[0]["singleLoc"]["unique_asset_id"], "single")]
+
+    def test_deleted_structure_still_removes_its_stop(self, tmp_path):
+        """The other side of the rule above: a stop that had a structure
+        at pull time goes when the user deletes that structure."""
+        p = pulled_network(tmp_path)
+        raw = p.data["multiLoc"][0]["Stops"]
+        at = (raw[0]["singleLoc"]["origin_longitude"], raw[0]["singleLoc"]["origin_latitude"])
+        for layer in p.layers.values():
+            if layer.geometryType() != eb.GEOM_POINT:
+                continue
+            layer.dataProvider().deleteFeatures([
+                f.id() for f in layer.getFeatures()
+                if (float(f["_origin_lon"]), float(f["_origin_lat"])) == at])
+        routes = ib.reconstruct_routes(p.maps, skip_snapping=True)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        assert r.active_stop_count == len(raw) - 1
+        assert not any(s.is_server_only for s in r.stops)
+
+    def test_null_destination_name_stays_null(self, tmp_path):
+        """Metro Fiber Ring FC-005: a cable whose far end is not captured
+        has destination null.  Writing "" (or the name of whatever
+        structure sits there) counted as an edit on every push."""
+        def mutate(data):
+            for d in [data["dualLOCs"][0], data["multiLoc"][0]["dualLoc"]]:
+                d["LOCDestination"]["destination"] = None
+        p = pulled_network(tmp_path, mutate)
+        for routes in (None, ib.reconstruct_routes(p.maps, snap_tolerance=1.0)):
+            payload = build_pulled(p, routes)
+            for new, old in ((payload["dual_locs"][0], p.data["dualLOCs"][0]),
+                             (payload["multiLocs"][0]["dualLoc"], p.data["multiLoc"][0]["dualLoc"])):
+                assert new["LOCDestination"]["destination"] is None
+                assert new["updatedAt"] == old["updatedAt"]
+
+    def test_route_name_differing_from_asset_id_is_kept(self, tmp_path):
+        """LOC does not change a routed cable's asset id on push, only
+        the route name — so after a Route ID correction the two differ
+        (staging, 5 Nov 2026).  An unedited pull must not rename the
+        route back; an edited Route ID still renames it."""
+        def mutate(data):
+            data["multiLoc"][0]["multiName"] = "Feeder North"
+        p = pulled_network(tmp_path, mutate)
+        assert build_pulled(p)["multiLocs"][0]["multiName"] == "Feeder North"
+        cables = p.layers["Fiber Cable (LOC)"]
+        f = feature_where(cables, "Route ID", "CBL-001")
+        cables.dataProvider().changeAttributeValues(
+            {f.id(): {cables.fields().indexOf("Route ID"): "CBL-001A"}})
+        assert build_pulled(p)["multiLocs"][0]["multiName"] == "CBL-001A"
+
     def test_variant_keys_normalised(self, tmp_path):
         def mutate(data):
             m = data["multiLoc"][0]

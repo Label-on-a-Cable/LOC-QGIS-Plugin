@@ -259,6 +259,9 @@ def preview_then_cancel(lv, inspect=None):
     lv.drive(PushPreviewDialog, driver)
     act(lv, "Action: click Push to LOC")
     lv.plugin.actions["push"].trigger()
+    # 1.7.0 reads the live state first; the preview opens only after it
+    wait_until(lambda: lv.plugin._push_state_task is None,
+               timeout_ms=300000, message="push state")
     pump(30)
     return seen
 

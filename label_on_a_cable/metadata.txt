@@ -25,4 +25,6 @@ changelog=
     - Saved LOC IDs follow assets when features are renumbered or layers are re-created
     - Pulled layers open with their stop fields mapped, with a clearer stop section in Category Mapping
     - Unedited pull and push no longer reports phantom created or updated LOCs
+    - Stops added in the LOC app without a structure stay on their route after a pull
+    - Pulled fields keep their values when a record also holds an old numbered copy
     - Clearer errors for timed-out and oversized pushes

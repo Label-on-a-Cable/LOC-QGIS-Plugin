@@ -36,6 +36,10 @@ class Stop:
     # Source references
     point_layer_id: str = ""
     point_feature_id: int = -1
+    # loc_id of a pulled stop LOC holds with no structure point under it
+    # (a stop added in the LOC app straight onto the cable).  Such a stop
+    # has no point feature; it is pushed back from the server's own record.
+    server_loc_id: str = ""
 
     # User overrides (mutable via review UI)
     display_name: str = ""          # editable; defaults to original_name
@@ -44,6 +48,12 @@ class Stop:
     def __post_init__(self):
         if not self.display_name:
             self.display_name = self.original_name
+
+    @property
+    def is_server_only(self) -> bool:
+        """True for a pulled stop that has no structure point (see
+        ``server_loc_id``)."""
+        return bool(self.server_loc_id) and self.point_feature_id < 0
 
     @property
     def is_endpoint(self) -> bool:

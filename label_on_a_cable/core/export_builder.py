@@ -172,8 +172,12 @@ def build_payload(
         intermediates: List[Stop] = []
         stale_drops = 0
         for stop in route.intermediate_stops:
-            if _get_feature(project, stop.point_layer_id,
-                            stop.point_feature_id) is None:
+            if stop.is_server_only:
+                # LOC holds this stop without a structure; there is no
+                # point feature to lose.  It goes back as pulled.
+                intermediates.append(stop)
+            elif _get_feature(project, stop.point_layer_id,
+                              stop.point_feature_id) is None:
                 stale_drops += 1
                 QgsMessageLog.logMessage(
                     f"Stop '{stop.display_name}' of route "
@@ -224,7 +228,17 @@ def build_payload(
                     if kl == "stops" or kl == "dualloc" or kl == "dual_loc":
                         del mloc_entry[k]
                 mloc_entry["dualLoc"] = dual_loc  # already patched
-                mloc_entry["multiName"] = route.line_name
+                # LOC keeps a route's name (multiName) apart from its
+                # cable's asset id, and the two can differ.  The pulled
+                # Route ID column shows the asset id, so only an edited
+                # Route ID renames the route; otherwise an unedited
+                # pull → push would rename it after the asset id.
+                raw_dual = (raw_mloc.get("dualLoc") or raw_mloc.get("dualLOC")
+                            or raw_mloc.get("dual_loc") or {})
+                if (not mloc_entry.get("multiName")
+                        or dual_loc.get("unique_asset_id")
+                        != raw_dual.get("unique_asset_id")):
+                    mloc_entry["multiName"] = route.line_name
                 mloc_entry["id"] = multi_id or mloc_entry.get("id", str(uuid4()))
                 rebuilt_stops = _rebuild_stops_from_raw(
                     raw_mloc, intermediates, route, mapping_by_layer,
@@ -2071,9 +2085,15 @@ def _patch_dual_loc(
     if dest_qfield and line_feature is not None:
         destination = _safe_value(line_feature, dest_qfield)
     if not destination:
-        destination = raw_dest.get("destination") or route.destination
-    # Patch both the top-level and nested destination name
-    if isinstance(patched["LOCDestination"], dict):
+        if "destination" in raw_dest and raw_dest["destination"] is None:
+            destination = ""    # LOC has no name for it yet; do not invent one
+        else:
+            destination = raw_dest.get("destination") or route.destination
+    # Patch the nested destination name.  A destination LOC holds as
+    # null (end not captured yet) stays null: writing "" over it would
+    # count as an edit and bump the record on every push.
+    if isinstance(patched["LOCDestination"], dict) and (
+            destination or raw_dest.get("destination") is not None):
         patched["LOCDestination"]["destination"] = destination
 
     # Bump updatedAt if any user-editable value actually changed.
@@ -2196,7 +2216,37 @@ def _rebuild_stops_from_raw(
     # another added (equal counts), giving two stops one record.
     resolved = []  # (stop, pt_feature, pt_xy, matched_entry or None)
     claimed: set = set()
+
+    # Stops without a structure are their own server record: take each
+    # one's entry out of the coordinate index first, so no structure
+    # that happens to sit there can claim it.
+    def _sloc_of(entry):
+        return (entry.get("singleLoc") or entry.get("singleLOC")
+                or entry.get("single_loc") or {})
+
+    server_only_entry: Dict[str, dict] = {}
+    wanted = {s.server_loc_id for s in intermediates if s.is_server_only}
+    if wanted:
+        for entry in sorted_orig:
+            lid = _sloc_of(entry).get("loc_id", "")
+            if lid in wanted and lid not in server_only_entry:
+                server_only_entry[lid] = entry
+                for entries in orig_by_coord.values():
+                    if entry in entries:
+                        entries.remove(entry)
+
     for stop in intermediates:
+        if stop.is_server_only:
+            entry = server_only_entry.get(stop.server_loc_id)
+            if entry is None:
+                continue        # no longer in the pulled record: nothing to send
+            sl = _sloc_of(entry)
+            claimed.add(id(entry))
+            resolved.append((stop, None,
+                             (_float_val(sl.get("origin_longitude", 0)),
+                              _float_val(sl.get("origin_latitude", 0))),
+                             entry))
+            continue
         pt_feature = _get_feature(
             project, stop.point_layer_id, stop.point_feature_id,
         )
@@ -2283,7 +2333,8 @@ def _rebuild_stops_from_raw(
             # must not rewrite them (LOC counts each as an update).
             orig_uid = orig_sloc.get("unique_asset_id", "")
             renamed = stop.display_name != stop.original_name
-            if renamed or not (orig_uid and orig_sloc.get("actual_asset_name")):
+            if renamed or not (stop.is_server_only or (
+                    orig_uid and orig_sloc.get("actual_asset_name"))):
                 # Patch identity fields from the reviewed label / point feature
                 pt_mapping = mapping_by_layer.get(stop.point_layer_id)
                 new_base_uid, actual_name = _stop_identity(
