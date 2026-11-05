@@ -2,7 +2,7 @@
 name=Label on a Cable - KelTech IoE
 qgisMinimumVersion=3.22
 description=Generate, synchronise and manage infrastructure asset labels with the LOC platform.
-version=1.7.0
+version=1.7.1
 author=Brandon Kellett, KelTech IoE
 email=loc@keltechioe.com
 supportsQt6=True
@@ -18,10 +18,11 @@ deprecated=False
 hasProcessingProvider=False
 
 changelog=
-    1.7.0
-    - Updated push logic with a clearer preview of what will change in LOC
-    - Improved Sync with LOC reporting
-    1.6.3
-    - Workspace locations are now grouped by Global Identifier and Project, matching the LOC dashboard
-    - Easier navigation when working across multiple projects
-    - General maintenance and stability improvements
+    1.7.1
+    - Correcting a Route ID after a push now updates the route and its stops instead of deleting and re-creating them
+    - New ingress/egress structures on a pulled route now push both stops
+    - Moved and co-located structures on pulled routes keep their stop records
+    - Saved LOC IDs follow assets when features are renumbered or layers are re-created
+    - Pulled layers open with their stop fields mapped, with a clearer stop section in Category Mapping
+    - Unedited pull and push no longer reports phantom created or updated LOCs
+    - Clearer errors for timed-out and oversized pushes
