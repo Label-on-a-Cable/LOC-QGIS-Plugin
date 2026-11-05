@@ -600,7 +600,8 @@ def push_for_real(lv, during_preview=None):
     calls_before = len(lv.msgbox.calls)
     act(lv, "Action: click Push to LOC")
     lv.plugin.actions["push"].trigger()
-    wait_until(lambda: lv.plugin._push_task is None, timeout_ms=300000, message="push")
+    wait_until(lambda: lv.plugin._push_state_task is None
+               and lv.plugin._push_task is None, timeout_ms=300000, message="push")
     pump(50)
     seen["dialogs"] = lv.msgbox.calls[calls_before:]
     msg = lv.iface.messageBar().last()

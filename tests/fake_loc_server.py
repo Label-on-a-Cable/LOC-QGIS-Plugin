@@ -226,28 +226,60 @@ class FakeLocServer:
             multis[ml["id"]] = ml
         return singles, duals, multis
 
+    def _uid_index(self, location_id):
+        """``{(unique_asset_id, kind): record}`` over every LOC held.
+
+        The real server matches *standalone* singles and duals by asset
+        id within the location, not by loc_id (loc-next
+        ``applyStandaloneSingle`` / ``applyStandaloneDual``; confirmed by
+        dry run on staging, 5 Nov 2026: renaming a standalone single
+        reports one created LOC, renaming a route or a stop does not).
+        """
+        st = self.loc_state(location_id)
+        index = {}
+
+        def add(rec, kind):
+            if rec.get("unique_asset_id"):
+                index.setdefault((rec["unique_asset_id"], kind), rec)
+
+        for rec in st["single"].values():
+            add(rec, "single")
+        for rec in st["dual"].values():
+            add(rec, "dual")
+        for m in st["multi"].values():
+            add(m["dualLoc"], "dual")
+            for s in m["Stops"]:
+                add(s["singleLoc"], "single")
+        return index
+
+    def _standalone_match(self, location_id, by_uid, kind, lid, rec):
+        """The stored record a pushed standalone *rec* updates, or None."""
+        if rec.get("unique_asset_id"):
+            return by_uid.get((rec["unique_asset_id"], kind))
+        return self.loc_state(location_id)[kind].get(lid)
+
     def _diff_stats(self, location_id, payload):
         st = self.loc_state(location_id)
         singles, duals, multis = self._index_payload(payload)
+        by_uid = self._uid_index(location_id)
 
-        def stamp_map(kind_new, kind_old):
-            created = updated = 0
-            for lid, rec in kind_new.items():
-                old = kind_old.get(lid)
+        created = updated = 0
+        kept = set()               # stored loc_ids this push accounts for
+        for kind, recs in (("single", singles), ("dual", duals)):
+            for lid, rec in recs.items():
+                old = self._standalone_match(location_id, by_uid, kind, lid, rec)
                 if old is None:
                     created += 1
-                elif rec.get("updatedAt") != old.get("updatedAt"):
-                    updated += 1
-            return created, updated
-
-        c1, u1 = stamp_map(singles, st["single"])
-        c2, u2 = stamp_map(duals, st["dual"])
-        created, updated = c1 + c2, u1 + u2
+                else:
+                    kept.add(old["loc_id"])
+                    if rec.get("updatedAt") != old.get("updatedAt"):
+                        updated += 1
         new_ids = set(singles) | set(duals)
         for mid, ml in multis.items():
             old = st["multi"].get(mid)
             dl = ml["dualLoc"]
             new_ids.add(dl["loc_id"])
+            kept.add(dl["loc_id"])
             old_dl = old["dualLoc"] if old else None
             if old_dl is None or old_dl["loc_id"] != dl["loc_id"]:
                 created += 1
@@ -260,12 +292,13 @@ class FakeLocServer:
             for s in ml["Stops"]:
                 sl = s["singleLoc"]
                 new_ids.add(sl["loc_id"])
+                kept.add(sl["loc_id"])
                 o = old_stops.get(sl["loc_id"])
                 if o is None:
                     created += 1
                 elif sl.get("updatedAt") != o.get("updatedAt"):
                     updated += 1
-        deleted = len(self.all_loc_ids(location_id) - new_ids)
+        deleted = len(self.all_loc_ids(location_id) - kept)
         return {
             "createdLocs": created,
             "updatedLocs": updated,
@@ -277,13 +310,23 @@ class FakeLocServer:
     def _apply_push(self, location_id, payload):
         st = self.loc_state(location_id)
         singles, duals, multis = self._index_payload(payload)
-        # Server-owned fields survive an update when the plugin omits them.
+        by_uid = self._uid_index(location_id)
+        # An updated standalone record keeps the loc_id the server already
+        # holds for that asset id; server-owned fields survive the update
+        # when the plugin omits them.
+        stored_singles, stored_duals = {}, {}
         for lid, rec in singles.items():
-            old = st["single"].get(lid, {})
+            old = self._standalone_match(location_id, by_uid, "single", lid, rec) or {}
+            rec["loc_id"] = old.get("loc_id", lid)
             rec.setdefault("origin_status", old.get("origin_status", "unassigned"))
             rec.setdefault("notes", old.get("notes"))
-        st["single"] = copy.deepcopy(singles)
-        st["dual"] = copy.deepcopy(duals)
+            stored_singles[rec["loc_id"]] = rec
+        for lid, rec in duals.items():
+            old = self._standalone_match(location_id, by_uid, "dual", lid, rec) or {}
+            rec = {**rec, "loc_id": old.get("loc_id", lid)}
+            stored_duals[rec["loc_id"]] = rec
+        st["single"] = copy.deepcopy(stored_singles)
+        st["dual"] = copy.deepcopy(stored_duals)
         st["multi"] = copy.deepcopy(multis)
         self.push_count += 1
 

@@ -81,6 +81,7 @@ def _reset_export_builder_globals():
     eb._current_stamp_layer = None
     eb._layer_identity.clear()
     eb._ambiguous_asset_keys.clear()
+    eb._live_asset_keys.clear()
     eb._key_memo.clear()
 
 
@@ -298,12 +299,31 @@ class MessageBoxRecorder:
     def titles(self, kind=None):
         return [c[1] for c in self.calls if kind is None or c[0] == kind]
 
+    _ICON_KINDS = {
+        QMessageBox.Icon.Warning: "warning",
+        QMessageBox.Icon.Critical: "critical",
+        QMessageBox.Icon.Question: "question",
+    }
+
+    def exec_box(self, box):
+        """Stand-in for ``QMessageBox.exec`` on a hand-built box (the
+        reconcile prompts since 1.7.0).  A Yes/No box takes the next
+        queued answer; an OK-only box is just recorded."""
+        kind = self._ICON_KINDS.get(box.icon(), "information")
+        self.calls.append((kind, box.windowTitle(), box.text()))
+        if self.on_call is not None:
+            self.on_call(kind, box.windowTitle(), box.text())
+        if box.standardButtons() & QMessageBox.StandardButton.Yes:
+            return self.answers.pop(0) if self.answers else self.default
+        return QMessageBox.StandardButton.Ok
+
 
 @pytest.fixture
 def msgbox(monkeypatch):
     rec = MessageBoxRecorder()
     for kind in ("question", "warning", "critical", "information"):
         monkeypatch.setattr(QMessageBox, kind, staticmethod(rec._make(kind)))
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: rec.exec_box(box))
     return rec
 
 

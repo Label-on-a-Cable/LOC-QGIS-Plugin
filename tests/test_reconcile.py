@@ -163,6 +163,14 @@ class PredictDeletionsTests(unittest.TestCase):
         )
 
 
+#: These tests build layers from the stub's constructor, so they only run
+#: under ``python -m unittest``.  Under pytest the real QGIS is loaded and
+#: tests/test_export_builder.py::TestAuditExportCoverage covers the same
+#: ground with real layers.
+_STUBBED = QgsProject is qgis_stub.QgsProject
+
+
+@unittest.skipUnless(_STUBBED, "needs the qgis stub; see TestAuditExportCoverage")
 class AuditExportCoverageTests(unittest.TestCase):
     def setUp(self):
         self.project = QgsProject.reset()

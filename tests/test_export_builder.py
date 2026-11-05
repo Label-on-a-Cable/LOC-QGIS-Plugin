@@ -103,7 +103,6 @@ class TestPayloadStructure:
         assert (len(p["multiLocs"]), len(p["dual_locs"]), len(p["single_locs"])) == (1, 1, 6)
         assert [e["type"] for e in p["_feature_map"]].count("single") == 6
         assert p["_stale_stop_drops"] == {}
-        assert "_deleted_loc_ids" not in p
 
     def test_multiloc_route(self, net):
         ml = build(net)["multiLocs"][0]
@@ -240,15 +239,58 @@ class TestPayloadStructure:
         assert dl["actual_asset_name"] == "Feeder 1"
         assert dl["LOCDestination"]["destination"] == "Blue"
 
-    def test_pulled_ids_produce_delete_list(self, net):
-        p1 = build(net)
-        eb.stamp_ids_after_push(p1)
-        kept = p1["single_locs"][0]["attributes"]["loc_id"]
-        p2 = build(net, pulled_loc_ids={kept, "gone-1", "gone-2"})
-        assert p2["_deleted_loc_ids"] == ["gone-1", "gone-2"]
+    def test_server_records_missing_from_payload_are_predicted_deleted(self, net):
+        p = build(net)
+        kept = p["single_locs"][0]["unique_asset_id"]
+        server = {
+            "singleLOCs": [{"loc_id": "any", "unique_asset_id": kept},
+                           {"loc_id": "gone-1", "unique_asset_id": "G1"}],
+            "dualLOCs": [{"loc_id": "gone-2", "unique_asset_id": "G2"}],
+        }
+        assert eb.predict_deletions(p, server) == [("G1", "single"), ("G2", "dual")]
 
     def test_payload_is_json_serialisable(self, net):
         json.dumps(build(net))
+
+
+# ----------------------------------------------------------------------
+# Coverage audit (1.7.0): mapped layers whose features never reach the
+# payload.  Real-layer twin of tests/test_reconcile.py's stub tests.
+# ----------------------------------------------------------------------
+
+class TestAuditExportCoverage:
+    def test_healthy_network_reports_nothing(self, net):
+        assert eb.audit_export_coverage(net.maps, net.cats) == []
+
+    def test_each_reason_names_the_layer_and_its_feature_count(self, net):
+        net.maps[0].enabled_for_export = False
+        net.maps[1].category_id = ""
+        net.maps[2].category_id = "deleted-category"
+        problems = eb.audit_export_coverage(net.maps, net.cats)
+        project = QgsProject.instance()
+        assert [(name, count) for name, count, _ in problems] == [
+            (project.mapLayer(lm.layer_id).name(),
+             project.mapLayer(lm.layer_id).featureCount()) for lm in net.maps]
+        reasons = [why for _, _, why in problems]
+        assert "'Create in LOC' is switched off" in reasons[0]
+        assert "no LOC category is mapped" in reasons[1]
+        assert "no longer exists" in reasons[2] and "Uncategorised" in reasons[2]
+
+    def test_point_layer_on_a_dual_category(self, net):
+        dual = next(c.category_id for c in net.cats.values() if c.is_dual)
+        project = QgsProject.instance()
+        points = [lm for lm in net.maps
+                  if project.mapLayer(lm.layer_id).geometryType() == eb.GEOM_POINT]
+        points[0].category_id = dual
+        (problem,) = eb.audit_export_coverage(net.maps, net.cats)
+        assert "dual category" in problem[2]
+
+    def test_empty_and_missing_layers_are_ignored(self, net):
+        net.maps[0].layer_id = "missing"
+        layer = QgsProject.instance().mapLayer(net.maps[1].layer_id)
+        layer.dataProvider().deleteFeatures([f.id() for f in layer.getFeatures()])
+        net.maps[1].enabled_for_export = False
+        assert eb.audit_export_coverage(net.maps, net.cats) == []
 
 
 # ----------------------------------------------------------------------
@@ -259,7 +301,7 @@ def test_payload_summary(net):
     assert eb.payload_summary(build(net)) == {
         "location": "Testing Location", "routes_with_stops": 1,
         "routes_without_stops": 1, "total_routes": 2, "total_stops": 4,
-        "standalone_assets": 6, "total_locs": 12, "will_be_deleted": 0,
+        "standalone_assets": 6, "total_locs": 12,
     }
 
 
@@ -271,11 +313,9 @@ def test_log_payload_metrics(net):
         assert needle in text
     assert "DUPLICATE" not in text and "Will be deleted" not in text
 
-    p["_deleted_loc_ids"] = ["a", "b"]
     dup = p["multiLocs"][0]["Stops"][0]["singleLoc"]["loc_id"]
     p["multiLocs"][0]["Stops"][1]["singleLoc"]["loc_id"] = dup
     text = eb.log_payload_metrics(p)
-    assert "Will be deleted on server (absent from payload): 2" in text
     assert "DUPLICATE stop loc_ids: 1" in text
 
 
@@ -660,8 +700,11 @@ class TestStampMigration:
 def build_pulled(p, routes=None):
     if routes is None:
         routes = ib.reconstruct_routes(p.maps, skip_snapping=True)
-    return eb.build_payload(routes, p.maps, p.cats, p.loc, "u-0001", "org-0001",
-                            pulled_loc_ids=p.ids)
+    payload = eb.build_payload(routes, p.maps, p.cats, p.loc, "u-0001", "org-0001")
+    # What the push would bin, judged against the location as pulled
+    # (1.7.0 predicts this from live server state, not from the payload).
+    payload["_test_doomed"] = eb.predict_deletions(payload, p.data)
+    return payload
 
 
 def clear_hidden_coords(layer, fid, *names):
@@ -678,7 +721,7 @@ class TestPulledRoundTrip:
             data["multiLoc"][0]["Stops"][0]["singleLoc"]["sla_fields"] = {"x": 1}
         p = pulled_network(tmp_path, mutate)
         payload = build_pulled(p)
-        assert payload["_deleted_loc_ids"] == []
+        assert payload["_test_doomed"] == []
 
         src = {s["unique_asset_id"]: s for s in p.data["singleLOCs"]}
         for s in payload["single_locs"]:
@@ -853,7 +896,7 @@ class TestPulledRoundTrip:
             assert s["singleLoc"]["name"] == f"Stop_{s['stopNumber']}_CBL-001"
         p2_stop = [lid for lid, s in raw.items()
                    if s["singleLoc"]["unique_asset_id"] == "CBL-001_Pole 2"]
-        assert payload["_deleted_loc_ids"] == p2_stop
+        assert p2_stop and payload["_test_doomed"] == [("CBL-001_Pole 2", "single")]
         assert eb.validate_payload(payload) == []
 
     def test_added_stop_is_created(self, tmp_path):
@@ -905,7 +948,7 @@ class TestPulledRoundTrip:
         assert len(r.intermediate_stops) == len(raw_uids)          # nothing "added"
 
         payload = build_pulled(p, routes)
-        assert payload["_deleted_loc_ids"] == []
+        assert payload["_test_doomed"] == []
         stops = payload["multiLocs"][0]["Stops"]
         assert [s["singleLoc"]["unique_asset_id"] for s in stops] == raw_uids
         assert [s["stop_id"] for s in stops] == \
@@ -980,7 +1023,7 @@ class TestPulledRoundTrip:
         r = [r for r in routes if r.line_name == "CBL-001"][0]
         assert "Handhole Z" not in [s.structure_name for s in r.stops]
         assert r.active_stop_count == 4
-        assert build_pulled(p, routes)["_deleted_loc_ids"] == []
+        assert build_pulled(p, routes)["_test_doomed"] == []
 
     def test_unmapped_destination_keeps_server_name(self, tmp_path):
         """OM_DUCT_11 pattern: LOC's destination name differs from the
@@ -1048,7 +1091,7 @@ class TestPulledRoundTrip:
         r = [r for r in routes if r.line_name == "CBL-001"][0]
         assert "Pole 3" in [s.structure_name for s in r.stops]
         payload = build_pulled(p, routes)
-        assert payload["_deleted_loc_ids"] == []
+        assert payload["_test_doomed"] == []
         (p3,) = self._stop_named(payload["multiLocs"][0]["Stops"], "CBL-001_Pole 3")
         assert p3["singleLoc"]["loc_id"] in raw
         assert p3["singleLoc"]["origin_longitude"] != \
@@ -1072,9 +1115,7 @@ class TestPulledRoundTrip:
                   if s["singleLoc"]["unique_asset_id"] == "CBL-001_Pole 3"][0]
         assert p3["singleLoc"]["loc_id"] == p3_old
         assert p3["singleLoc"]["origin_longitude"] != raw[p3_old]["singleLoc"]["origin_longitude"]
-        assert payload["_deleted_loc_ids"] == [
-            lid for lid, s in raw.items()
-            if s["singleLoc"]["unique_asset_id"] == "CBL-001_Pole 2"]
+        assert payload["_test_doomed"] == [("CBL-001_Pole 2", "single")]
         assert eb.validate_payload(payload) == []
 
     def test_renamed_route_id_renames_its_stops(self, tmp_path):
@@ -1096,7 +1137,7 @@ class TestPulledRoundTrip:
         assert [s["singleLoc"]["actual_asset_name"] for s in m["Stops"]] == \
             [s["singleLoc"]["actual_asset_name"] for s in raw.values()]
         assert [s["singleLoc"]["loc_id"] for s in m["Stops"]] == list(raw)
-        assert payload["_deleted_loc_ids"] == []
+        assert payload["_test_doomed"] == []
 
     def test_variant_keys_normalised(self, tmp_path):
         def mutate(data):
@@ -1150,8 +1191,8 @@ def test_sync_stamps_from_server(net):
         LayerMapping(layer_id="missing", category_id="c"),
         LayerMapping(layer_id=net.layers["chambers"].id(), category_id=CAT_CHAMBER),
     ]
-    matched, total = eb.sync_stamps_from_server(server, LOCATION_ID, maps)
-    assert (matched, total) == (3, 3)
+    report = eb.sync_stamps_from_server(server, LOCATION_ID, maps)
+    assert (report.matched, report.total_server) == (3, 3)
 
     p = build(net)
     ml = p["multiLocs"][0]
@@ -1165,7 +1206,8 @@ def test_sync_stamps_from_server(net):
 
 
 def test_sync_with_no_server_locs(net):
-    assert eb.sync_stamps_from_server({}, LOCATION_ID, net.maps) == (0, 0)
+    report = eb.sync_stamps_from_server({}, LOCATION_ID, net.maps)
+    assert (report.matched, report.total_server, report.ok) == (0, 0, False)
 
 
 # ----------------------------------------------------------------------

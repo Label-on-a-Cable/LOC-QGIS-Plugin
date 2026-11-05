@@ -115,9 +115,17 @@ def push(ui, before_confirm=None, confirm=True):
         else:
             dlg.reject()
     ui.drive(PushPreviewDialog, driver)
-    ui.plugin.actions["push"].trigger()
+    start_push(ui)
     wait_until(lambda: ui.plugin._push_task is None, message="push")
     pump(20)
+
+
+def start_push(ui):
+    """Click Push and wait for the live-state check that precedes the
+    prompts and the preview (1.7.0: the location is fetched first)."""
+    ui.plugin.actions["push"].trigger()
+    wait_until(lambda: ui.plugin._push_state_task is None, message="push state")
+    pump(5)
 
 
 def last_preview_stats(ui):
@@ -448,6 +456,30 @@ class TestPush:
         assert server_ids(ui.server) == ids
         assert ui.server.push_count == 2
 
+    def test_renamed_standalone_structure_warns_before_replacing_it(self, ui):
+        """LOC matches standalone records by asset id, so a corrected id
+        is a delete + create on the server whatever the plugin sends
+        (staging dry run, 5 Nov 2026).  The push must say so first."""
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        poles = layers["poles"]
+        fid = [f.id() for f in poles.getFeatures() if f["PoleID"] == "P5"][0]
+        poles.dataProvider().changeAttributeValues(
+            {fid: {poles.fields().indexOf("PoleID"): "P5A"}})
+        generate(ui)
+        ui.msgbox.answers = [NO]
+        start_push(ui)
+        kind, title, text = ui.msgbox.calls[-1]
+        assert (kind, title) == ("warning", "LOCs Will Be Deleted")
+        assert "  - P5  (single)" in text
+        assert ui.server.push_count == 1                 # declined: nothing sent
+        push(ui)
+        stats = last_preview_stats(ui)
+        assert (stats["Created LOCs"], stats["Deleted LOCs"]) == ("1", "1")
+        uids = {s["unique_asset_id"] for s in ui.server.loc_state()["single"].values()}
+        assert "P5A" in uids and "P5" not in uids
+
     def test_attribute_edit_pushes_one_update(self, ui):
         layers = design_project(ui)
         generate(ui)
@@ -626,10 +658,10 @@ class TestPushGuards:
         map_categories(ui, maps)
         generate(ui)
         ui.msgbox.answers = [NO]
-        ui.plugin.actions["push"].trigger()
+        start_push(ui)
         title, text = ui.msgbox.calls[-1][1:]
-        assert title == "Disabled Layers Will Be Removed from LOC"
-        assert "  - Chambers" in text
+        assert title == "Features Excluded From Push"
+        assert "  - Chambers (1 feature(s)): 'Create in LOC' is switched off" in text
         assert ui.server.push_count == 0
         ui.msgbox.answers = [YES]
         push(ui)
@@ -643,7 +675,7 @@ class TestPushGuards:
             {fid: {poles.fields().indexOf("PoleID"): "P1"}})
         generate(ui)
         ui.msgbox.answers = [NO]
-        ui.plugin.actions["push"].trigger()
+        start_push(ui)
         kind, title, text = ui.msgbox.calls[-1]
         assert (kind, title) == ("warning", "Push Warning")
         assert "'P1' is used by 2 features" in text
@@ -654,7 +686,7 @@ class TestPushGuards:
         generate(ui)
         monkeypatch.setattr(eb, "validate_payload",
                             lambda *a: [("error", "Duplicate stop loc_id x")])
-        ui.plugin.actions["push"].trigger()
+        start_push(ui)
         kind, title, text = ui.msgbox.calls[-1]
         assert (kind, title) == ("critical", "Push Validation Failed")
         assert "• Duplicate stop loc_id x" in text
@@ -817,6 +849,9 @@ class TestPull:
         push(ui, before_confirm=lambda dlg: rendered.extend(
             l.text() for l in dlg.findChildren(type(dlg._server_status))))
         assert "Will be deleted on server:" in rendered
+        kind, title, text = ui.msgbox.calls[-1]
+        assert (kind, title) == ("warning", "LOCs Will Be Deleted")
+        assert "  - P5  (single)" in text
         assert last_preview_stats(ui)["Deleted LOCs"] == "1"
         assert len(ui.server.loc_state()["single"]) == 5
 

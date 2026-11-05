@@ -138,7 +138,8 @@ def push(v, preview_caption="Push to LOC: the server dry-run preview",
             dlg.reject()
     v.drive(PushPreviewDialog, driver)
     v.plugin.actions["push"].trigger()
-    wait_until(lambda: v.plugin._push_task is None)
+    wait_until(lambda: v.plugin._push_state_task is None
+               and v.plugin._push_task is None)
     pump(30)
     return seen
 
