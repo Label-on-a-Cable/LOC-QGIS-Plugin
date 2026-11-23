@@ -101,9 +101,27 @@ def _push_allowed(request, target):
         return True
     if os.environ.get("LOC_LIVE_ALLOW_PUSH") != "1":
         pytest.skip("push scenario: run tests/run_live_videos.sh --allow-push")
-    if not is_test_host(target.base):
+    if not is_test_host(target.base) and not _prod_push_location():
         pytest.skip(f"pushes only run against a staging/test server, not {target.base}")
     return True
+
+
+def _prod_push_location():
+    """The one production location id the owner cleared for real pushes
+    (LOC_LIVE_PROD_PUSH_LOCATION_ID), or ""."""
+    return os.environ.get("LOC_LIVE_PROD_PUSH_LOCATION_ID", "").strip()
+
+
+def _push_target_ok(plugin, target):
+    """A real push may go to a staging/test host (the configured location),
+    or to exactly the production location id the owner cleared."""
+    loc = plugin.active_location
+    if loc is None or loc.name != target.location:
+        return False
+    if is_test_host(plugin.api.base_url):
+        return True
+    cleared = _prod_push_location()
+    return bool(cleared) and loc.location_id == cleared
 
 
 @pytest.fixture
@@ -122,8 +140,7 @@ def lv(request, target, iface, drive_modal, msgbox, opened_urls, recorder, tmp_p
             if not allow_push:
                 raise RuntimeError("live scenarios are read-only: real push blocked")
             active = p.active_location.name if p.active_location else ""
-            if target.server is None and (not is_test_host(p.api.base_url)
-                                          or active != target.location):
+            if target.server is None and not _push_target_ok(p, target):
                 raise RuntimeError(f"refusing to push to {p.api.base_url} / {active!r}")
         return real_push(payload, preview=preview)
     monkeypatch.setattr(p.api, "push_locs", guarded_push)
@@ -186,12 +203,36 @@ def open_location(lv):
     wait_until(lambda: sb._task is None, timeout_ms=60000, message="locations")
     tree = sb._tree
     gids = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
-    gid = next((g for g in gids if g.text(0).startswith(f"{lv.t.gid} (")), None)
-    assert gid is not None, f"Global Identifier {lv.t.gid!r} not in Workspace"
+    from label_on_a_cable.qt_compat import USER_ROLE
+
+    def gid_id(item):
+        # LOC_LIVE_GID / LOC_LIVE_LOCATION may be the names shown in the
+        # Workspace or the ids from the dashboard URL.
+        for it in location_items(item):
+            loc_obj = it.data(0, USER_ROLE)
+            g = getattr(getattr(getattr(loc_obj, "project", None), "global_identifier", None),
+                        "gid_id", "")
+            if g:
+                return g
+        return ""
+    gid = next((g for g in gids if g.text(0).startswith(f"{lv.t.gid} (")
+                or gid_id(g) == lv.t.gid), None)
+    if gid is None:
+        # Production's flat locations API carries no GID id: find the GID
+        # holding the location by its id (unique) instead.
+        gid = next((g for g in gids for it in location_items(g)
+                    if getattr(it.data(0, USER_ROLE), "location_id", "") == lv.t.location), None)
+    assert gid is not None, (f"Global Identifier {lv.t.gid!r} not in Workspace (it lists: "
+                             + ", ".join(g.text(0) for g in gids)[:400] + ")")
     tree.scrollToItem(gid)
-    act(lv, f"Result: Workspace lists locations; expand “{lv.t.gid}”")
-    loc = next((it for it in location_items(gid) if it.text(0) == lv.t.location), None)
-    assert loc is not None, f"Location {lv.t.location!r} not under {lv.t.gid!r}"
+    act(lv, f"Result: Workspace lists locations; expand “{gid.text(0)}”")
+    loc = next((it for it in location_items(gid) if it.text(0) == lv.t.location
+                or getattr(it.data(0, USER_ROLE), "location_id", "") == lv.t.location), None)
+    assert loc is not None, (f"Location {lv.t.location!r} not under {gid.text(0)!r} (it has: "
+                             + ", ".join(it.text(0) for it in location_items(gid))[:400] + ")")
+    # Captions and the push guard use the names.
+    lv.t.gid = gid.text(0).rsplit(" (", 1)[0]
+    lv.t.location = loc.text(0)
     tree.setCurrentItem(loc)
     tree.scrollToItem(loc)
     tree.itemClicked.emit(loc, 0)
@@ -445,6 +486,7 @@ def test_live_remove_one_add_one(lv):
     sign_in(lv)
     open_location(lv)
     pull(lv)
+    data = lv.plugin.api.get_locs_for_location(_location_id(lv))   # read-only
     route, a, b, sa, sb = pick_route(lv.plugin)
     before = route.active_stop_count
     zoom_to(lv, [a, b])
@@ -463,7 +505,7 @@ def test_live_remove_one_add_one(lv):
     act(lv, f"Action: select {victim.structure_name} and click Remove → "
             f"{r2.active_stop_count} stops, same as at pull time")
     close_review(lv)
-    preview_then_cancel(lv)
+    seen = preview_then_cancel(lv)
     blocked = [c for c in lv.msgbox.calls if c[1] == "Push Validation Failed"]
     if blocked:
         lv.rec.show_message_box(
@@ -473,6 +515,25 @@ def test_live_remove_one_add_one(lv):
     else:
         act(lv, "Push was not blocked: the new structure got its own record", kind="ok")
     assert not blocked
+    # The removed stop's record must leave the payload and the new structure
+    # must be a new record.  Staging Howth OM_FIB_4_4, 6 Nov 2026: with the
+    # counts equal the new structure silently took the removed stop's record.
+    line = _layer(route.line_layer_id).getFeature(route.line_feature_id)
+    multi_id = line["_multi_id"]
+    raw = next(m for m in data["multiLoc"] if m.get("id") == multi_id)
+    raw_lids = {s["singleLoc"]["loc_id"] for s in raw.get("Stops", raw.get("stops", []))}
+    sent = next(m for m in seen["payload"]["multiLocs"] if m.get("id") == multi_id)
+    sent_lids = [s["singleLoc"]["loc_id"] for s in sent["Stops"]]
+    kept = [l for l in sent_lids if l in raw_lids]
+    new = [l for l in sent_lids if l not in raw_lids]
+    ok = len(new) == 1 and len(kept) == len(raw_lids) - 1
+    inspector(lv, f"{route.line_name}: records in the dry-run payload", [
+        f"stop records LOC holds for the route:        {len(raw_lids)}",
+        f"of those still in the payload:               {len(kept)}  (expected {len(raw_lids) - 1})",
+        f"new records in the payload:                  {len(new)}  (expected 1, the new structure)",
+    ], "The removed stop's record left the payload and the new structure got its own"
+       if ok else "The new structure took the removed stop's record", ok)
+    assert ok
 
 
 @title("Live · Bug 3 · moving a pulled point is not pushed")
@@ -637,7 +698,14 @@ def restore(lv, data):
     lv.plugin._categories_cache = {c.category_id: c for c in cats}
     show_map(lv.iface)
     act(lv, "Cleanup: load the backup taken at the start into this project")
-    push_for_real(lv)
+    # A restore overwrites LOC on purpose: no merge with LOC's changes.
+    from label_on_a_cable.core import rebase as rb
+    real = rb.rebase_payload
+    rb.rebase_payload = lambda payload, base, live: rb.RebaseReport()
+    try:
+        push_for_real(lv)
+    finally:
+        rb.rebase_payload = real
     act(lv, f"Cleanup done: {lv.t.location} restored from the backup")
 
 
@@ -835,12 +903,26 @@ def test_live_new_stop_stop_id(lv):
                          f"{s['stop_id']}{dup}")
         lines += ["", f"Stops LOC holds for the route after the push: {held} "
                       f"(payload had {len(sent_ids)})"]
-        ok = len(set(sent_ids)) == len(sent_ids)
+        raw_lids = {s["singleLoc"]["loc_id"] for s in raw.get("Stops", raw.get("stops", []))}
+        sent_lids = [s["singleLoc"]["loc_id"] for s in sent["Stops"]]
+        new_recs = [l for l in sent_lids if l not in raw_lids]
+        dropped = len(raw_lids) - len([l for l in sent_lids if l in raw_lids])
+        want_dropped = raw_n - (len(sent_ids) - 1)
+        lines += [f"new records in the payload: {len(new_recs)} (expected 1: QA New Structure); "
+                  f"original stop records dropped: {dropped} (expected {want_dropped})"]
+        ok_ids = len(set(sent_ids)) == len(sent_ids)
+        # Staging Howth OM_FIB_4_4, 6 Nov 2026: the new structure took the
+        # removed stop's record when the counts matched.
+        ok_recs = len(new_recs) == 1 and dropped == want_dropped
+        ok = ok_ids and ok_recs
         inspector(lv, f"{route.line_name} after the real push", lines,
                   ("Two stops in the payload share a stop_id"
                    + ("" if held == len(sent_ids)
                       else f"; LOC kept only {held} of {len(sent_ids)} stops"))
-                  if not ok else "Every stop kept its own stop_id", ok)
+                  if not ok_ids else (
+                      "The new structure took a removed stop's record" if not ok_recs
+                      else "Every stop kept its own stop_id and the new structure got its own record"),
+                  ok)
         assert ok
     finally:
         if pushed:

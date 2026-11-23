@@ -32,8 +32,13 @@ set -- "${args[@]}"
 if [[ "${LOC_LIVE_ALLOW_PUSH:-}" == "1" ]]; then
     case "${LOC_LIVE_BASE_URL:-}" in
         *staging*|*://dev*|*://test*|*://qa*|*sandbox*|*preview*) ;;
-        *) echo "--allow-push needs LOC_LIVE_BASE_URL set to a staging/test server" >&2
-           exit 2 ;;
+        *) if [[ -z "${LOC_LIVE_PROD_PUSH_LOCATION_ID:-}" ]]; then
+               echo "--allow-push needs LOC_LIVE_BASE_URL set to a staging/test server" \
+                    "(or LOC_LIVE_PROD_PUSH_LOCATION_ID: the one production location" \
+                    "the owner cleared for test pushes)" >&2
+               exit 2
+           fi
+           echo "PRODUCTION pushes limited to location id ${LOC_LIVE_PROD_PUSH_LOCATION_ID}" ;;
     esac
     echo "PUSH ENABLED against ${LOC_LIVE_BASE_URL} · ${LOC_LIVE_GID:-Test GID} › ${LOC_LIVE_LOCATION:-Test Location}"
 fi
