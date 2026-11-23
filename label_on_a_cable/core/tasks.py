@@ -15,11 +15,16 @@ from ..models.route import Route
 from .route_generator import DEFAULT_SNAP_TOLERANCE
 from ..qt_compat import TASK_CAN_CANCEL
 from ..services.api_client import ApiClient
-from ..services.exceptions import AuthenticationException, LOCAPIException
+from ..services.exceptions import (
+    AuthenticationException, LOCAPIException, NetworkException,
+)
 
 # Express's default JSON body limit; a payload above it is refused before
 # the route handler runs unless the server raises the limit explicitly.
 DEFAULT_BODY_LIMIT_BYTES = 100 * 1024
+
+# LOCs/delete-many takes at most 500 ids per call.
+DELETE_BATCH = 500
 
 
 def _sent_payload(payload: dict) -> dict:
@@ -149,6 +154,8 @@ class PushPreviewTask(QgsTask):
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
         self.payload_bytes: int = 0
+        # True when no HTTP response arrived (timeout / connection error)
+        self.network_error: bool = False
 
     def run(self):
         try:
@@ -167,6 +174,7 @@ class PushPreviewTask(QgsTask):
             )
         except LOCAPIException as exc:
             self.error = str(exc)
+            self.network_error = isinstance(exc, NetworkException)
             self.status_code = getattr(exc, "status_code", None)
             self.request_id = getattr(exc, "request_id", "")
             self.elapsed_seconds = getattr(exc, "elapsed_seconds", 0.0)
@@ -180,10 +188,18 @@ class PushPreviewTask(QgsTask):
 class PushTask(QgsTask):
     """Execute the real push to LOCs/plugin-v3."""
 
-    def __init__(self, api_client: ApiClient, payload: dict):
+    def __init__(self, api_client: ApiClient, payload: dict,
+                 delete_ids=None):
         super().__init__("Pushing to LOC", TASK_CAN_CANCEL)
         self.api = api_client
         self.payload = payload
+        # LOCs the user confirmed for deletion.  After the push the task
+        # makes sure they are gone: a capture-mode project's push deletes
+        # nothing (loc-next merge mode), so the task bins what is left.
+        self.delete_ids = list(delete_ids or [])
+        self.deleted_ids: List[str] = []
+        self.not_deleted: List[str] = []
+        self.delete_error: Optional[str] = None
         self.message: str = ""
         self.error: Optional[str] = None
         # Diagnostics (populated on failure)
@@ -191,6 +207,8 @@ class PushTask(QgsTask):
         self.request_id: str = ""
         self.elapsed_seconds: float = 0.0
         self.payload_bytes: int = 0
+        # True when no HTTP response arrived (timeout / connection error)
+        self.network_error: bool = False
 
     def run(self):
         try:
@@ -201,8 +219,11 @@ class PushTask(QgsTask):
                 self.message = data.get("message", "Push complete.")
             else:
                 self.message = "Push complete."
+            if self.delete_ids:
+                self._finish_deletions()
         except LOCAPIException as exc:
             self.error = str(exc)
+            self.network_error = isinstance(exc, NetworkException)
             self.status_code = getattr(exc, "status_code", None)
             self.request_id = getattr(exc, "request_id", "")
             self.elapsed_seconds = getattr(exc, "elapsed_seconds", 0.0)
@@ -212,16 +233,60 @@ class PushTask(QgsTask):
             return False
         return True
 
+    def _present(self, ids) -> List[str]:
+        from .export_builder import server_loc_index
+        location_id = self.payload.get("location_id", "")
+        live = server_loc_index(self.api.get_locs_for_location(location_id))
+        return [i for i in ids if i in live]
+
+    def _finish_deletions(self):
+        """Bin the confirmed deletions the push left in place, then check.
+
+        Never fails the push: it has already succeeded.  What could not be
+        removed is reported in ``not_deleted`` / ``delete_error``.
+        """
+        try:
+            left = self._present(self.delete_ids)
+            for start in range(0, len(left), DELETE_BATCH):
+                batch = left[start:start + DELETE_BATCH]
+                try:
+                    self.api.delete_locs(batch, self.payload.get("location_id") or None)
+                except LOCAPIException as exc:
+                    # One record already gone (404) or removed meanwhile
+                    # (409) fails the whole batch: go one by one.
+                    if getattr(exc, "status_code", None) not in (404, 409):
+                        raise
+                    for loc_id in batch:
+                        try:
+                            self.api.delete_loc(loc_id)
+                        except LOCAPIException as one:
+                            if getattr(one, "status_code", None) != 404:
+                                raise
+            self.not_deleted = self._present(self.delete_ids)
+        except Exception as exc:  # noqa: BLE001 - reported, push stands
+            self.delete_error = str(exc)
+            try:
+                self.not_deleted = self._present(self.delete_ids)
+            except Exception:  # noqa: BLE001
+                self.not_deleted = list(self.delete_ids)
+        gone = set(self.delete_ids) - set(self.not_deleted)
+        self.deleted_ids = [i for i in self.delete_ids if i in gone]
+
 
 class FetchLocsTask(QgsTask):
     """Fetch all LOCs + categories for a location off the main thread."""
 
-    def __init__(self, api_client: ApiClient, location_id: str):
+    def __init__(self, api_client: ApiClient, location_id: str,
+                 project_id: str = ""):
         super().__init__("Fetching LOC data", TASK_CAN_CANCEL)
         self.api = api_client
         self.location_id = location_id
+        self.project_id = project_id
         self.locs_data: Optional[dict] = None
         self.categories: List[Category] = []
+        # The project's capture-mode switch (None: not asked / unreadable).
+        # In capture mode the server's push deletes nothing.
+        self.capture_mode: Optional[bool] = None
         self.error: Optional[str] = None
 
     def run(self):
@@ -229,6 +294,12 @@ class FetchLocsTask(QgsTask):
             self.locs_data = self.api.get_locs_for_location(self.location_id)
             cat_data = self.api.get_categories_by_location(self.location_id)
             self.categories = Category.list_from_api(cat_data)
+            if self.project_id:
+                try:
+                    project = self.api.get_project(self.project_id)
+                    self.capture_mode = bool(project.get("capture_mode"))
+                except LOCAPIException:
+                    self.capture_mode = None
         except LOCAPIException as exc:
             self.error = str(exc)
             return False

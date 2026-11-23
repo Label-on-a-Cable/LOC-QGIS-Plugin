@@ -55,6 +55,7 @@ class LabelOnACablePlugin:
         self._routes_snap_tolerance = None
 
         # Pull / import state
+        self._session_pulled_layers = set()  # layer ids pulled since QGIS started
         self._pulled_loc_ids = set()  # Set[str], used to pick the route
                                       # reconstruction path on regenerate
         self._pulled_multi_stop_counts = {}  # {multi_id: stop_count}
@@ -63,6 +64,10 @@ class LabelOnACablePlugin:
         # preview can predict deletions from what is actually on the
         # server rather than from what a Pull happened to remember.
         self._push_state_task = None
+        # loc_ids the user confirmed for deletion in the last push preview
+        self._pending_delete_ids = []
+        self._pending_rebase = None     # merge with LOC for the confirmed push
+        self._push_rebase = None
 
     _SNAP_TOLERANCE_KEY = "LOC/snap_tolerance"
 
@@ -362,6 +367,9 @@ class LabelOnACablePlugin:
     def _on_mapping_accepted(self, mappings, snap_tolerance):
         """Called when the user confirms category mappings."""
         self.layer_mappings = mappings
+        # Saved LOC IDs are keyed by each layer's asset id field
+        from .core.export_builder import set_layer_mappings
+        set_layer_mappings(mappings)
         # Clear pull state — new/changed mappings mean the user is working
         # with different layers (possibly a different project).
         self._pulled_loc_ids = set()
@@ -596,6 +604,34 @@ class LabelOnACablePlugin:
             )
             return
 
+        # Pulled layers are temporary (memory) layers: QGIS does not save
+        # their features, so a pulled project reopened after QGIS closed
+        # holds them empty.  Pushed, every LOC they held reads as deleted
+        # in QGIS and one "Yes" bins the location (probe, 15 Nov 2026).
+        emptied = [
+            layer.name() for layer in
+            (project.mapLayer(lm.layer_id) for lm in self.layer_mappings
+             if lm.enabled_for_export)
+            if layer.providerType() == "memory"
+            and layer.fields().indexOf("_loc_id") >= 0
+            and layer.featureCount() == 0
+            # Pulled in this session, so emptied by the user on purpose.
+            and layer.id() not in self._session_pulled_layers
+        ]
+        if emptied:
+            QMessageBox.critical(
+                self.iface.mainWindow(), "Pulled Layers Are Empty",
+                "These layers came from a pull and are empty:\n\n"
+                + "\n".join(f"  - {n}" for n in emptied)
+                + "\n\nPulled layers are temporary: QGIS does not save their "
+                "features, so they are empty after QGIS is closed and the "
+                "project reopened. Pushing them would delete their LOCs.\n\n"
+                "Nothing was pushed. Pull again to work on this location, and "
+                "to keep a pull between sessions, right-click each \"(LOC)\" "
+                "layer and choose Make Permanent before closing QGIS.",
+            )
+            return
+
         # Only warn about missing routes if line layers are actually mapped
         has_line_mappings = any(
             lm.enabled_for_export
@@ -636,6 +672,7 @@ class LabelOnACablePlugin:
 
         self._push_state_task = FetchLocsTask(
             self.api, self.active_location.location_id,
+            project_id=self.active_location.project.project_id,
         )
         self._push_state_task.taskCompleted.connect(self._on_push_state_fetched)
         self._push_state_task.taskTerminated.connect(self._on_push_state_failed)
@@ -666,12 +703,13 @@ class LabelOnACablePlugin:
         if task is None:
             return
         server_locs = task.locs_data or {}
+        capture_mode = task.capture_mode
 
         from qgis.core import Qgis, QgsMessageLog
         from .core.export_builder import (
             audit_export_coverage, build_payload, log_payload_metrics,
-            payload_summary, predict_deletions, server_loc_index,
-            validate_payload,
+            known_loc_ids, payload_summary, plan_deletions,
+            server_loc_index, validate_payload,
         )
         from .ui.push_preview_dialog import PushPreviewDialog
         from .ui.reconcile_dialog import (
@@ -767,20 +805,88 @@ class LabelOnACablePlugin:
             if reply != MB_YES:
                 return
 
-        # Predict deletions from the live snapshot, mirroring the
-        # server's per-bucket matching rules.
-        doomed = predict_deletions(payload, server_locs)
+        # What this push removes from LOC, from the live snapshot and the
+        # server's matching rules.  In a capture-mode project the server
+        # deletes nothing, so only records this project knows and the
+        # user removed are deleted — by the push task, which also checks
+        # afterwards that every confirmed deletion really left LOC.
+        # LOC's changes since the pull are kept: every value the map did
+        # not change is sent as LOC holds it now, stops LOC added to a
+        # route stay on it, and a value changed on both sides is the
+        # user's call (Brandon, 10 Nov 2026).
+        from qgis.core import QgsProject, QgsVectorLayer
+        from .core.rebase import PulledBase, rebase_payload
+        from .ui.reconcile_dialog import KEEP_THEIRS, confirm_conflicts
+        project = QgsProject.instance()
+        mapped = [project.mapLayer(lm.layer_id) for lm in self.layer_mappings]
+        rebase = rebase_payload(
+            payload,
+            PulledBase.from_layers([l for l in mapped if isinstance(l, QgsVectorLayer)]),
+            server_locs,
+        )
+        QgsMessageLog.logMessage(
+            f"Merge with LOC: {len(rebase.kept_from_loc)} record(s) keep LOC's "
+            f"changes, {len(rebase.stops_kept)} stop(s) added in LOC kept, "
+            f"{len(rebase.stops_gone)} removed in LOC, {len(rebase.conflicts)} "
+            f"conflict(s), {rebase.local_changes} change(s) on the map, "
+            f"{rebase.without_base} record(s) with no pulled copy",
+            "LOC Push", Qgis.MessageLevel.Info,
+        )
+        if rebase.conflicts:
+            keep = confirm_conflicts(self.iface.mainWindow(), rebase.conflicts)
+            if keep is None:
+                return
+            rebase.resolve(keep_theirs=keep == KEEP_THEIRS)
+
+        location_id = self.active_location.location_id
+        known = known_loc_ids(location_id)
+        if self._pulled_loc_ids:
+            known = (known or set()) | set(self._pulled_loc_ids)
+        plan = plan_deletions(payload, server_locs, capture_mode, known)
+        doomed = plan.doomed
         total_server = len(server_loc_index(server_locs))
+        QgsMessageLog.logMessage(
+            f"Project capture mode: {capture_mode}; "
+            f"{len(doomed)} LOC(s) to delete, {len(plan.kept)} kept "
+            "(captured in the field since the last pull)",
+            "LOC Push", Qgis.MessageLevel.Info,
+        )
         if doomed:
             QgsMessageLog.logMessage(
                 "Push would delete "
                 + ", ".join(f"{uid} ({ltype})" for uid, ltype in doomed),
                 "LOC Push", Qgis.MessageLevel.Warning,
             )
+        # The map is behind LOC: field captures it has never seen, or
+        # records and routes changed in LOC since the pull.  The push keeps
+        # them all; say so, and offer a pull only when that cannot replace
+        # changes the user has not pushed yet.
+        captures = ([(uid or "(no asset ID)", ltype) for _l, uid, ltype in plan.kept]
+                    if plan.capture_mode and plan.known else [])
+        if captures or rebase.loc_changes:
+            from .ui.reconcile_dialog import (
+                STALE_PULL, STALE_PUSH, confirm_stale_map,
+            )
+            answer = confirm_stale_map(
+                self.iface.mainWindow(), captures,
+                changed_in_loc=rebase.kept_from_loc,
+                stops_added=rebase.stops_kept, stops_removed=rebase.stops_gone,
+                local_changes=rebase.local_changes + len(plan.delete_ids),
+            )
+            if answer == STALE_PULL:
+                self._place_field_captures(
+                    server_locs, [lid for lid, _u, _t in plan.kept])
+                return
+            if answer != STALE_PUSH:
+                return
         if not confirm_deletions(
             self.iface.mainWindow(), doomed, total_server,
+            capture_mode=bool(capture_mode), kept=len(plan.kept),
+            known=plan.known,
         ):
             return
+        self._pending_delete_ids = plan.delete_ids
+        self._pending_rebase = rebase
 
         summary = payload_summary(payload)
         # Routes that matched no structures push with line-endpoint
@@ -799,6 +905,40 @@ class LabelOnACablePlugin:
         dlg.push_confirmed.connect(self._execute_push)
         dlg.exec()
 
+    def _place_field_captures(self, server_locs, loc_ids):
+        """Pull now: add what was captured in the field to the layers
+        mapped to its category.  The mapping and the reviewed routes stay
+        as they are; nothing is pushed."""
+        from .core.field_merge import place_field_captures
+        report = place_field_captures(
+            server_locs, loc_ids, self.layer_mappings,
+            self._categories_cache, self.active_location.location_id,
+        )
+        if report.placed:
+            # The layers changed, so the next Generate runs again; a new
+            # structure on a cable becomes one of its stops.
+            self._last_fingerprint = ""
+        lines = []
+        if report.placed:
+            lines.append(f"Added {len(report.placed)} asset(s) captured in the "
+                         "field to your layers:")
+            lines += [f"  - {uid}  ({layer})" for uid, layer in report.placed[:15]]
+            if len(report.placed) > 15:
+                lines.append(f"  ... and {len(report.placed) - 15} more")
+        if report.skipped:
+            if lines:
+                lines.append("")
+            lines.append(f"{len(report.skipped)} asset(s) were not added. LOC "
+                         "keeps them, and the push leaves them as they are:")
+            lines += [f"  - {uid}: {why}" for uid, why in report.skipped[:15]]
+            if len(report.skipped) > 15:
+                lines.append(f"  ... and {len(report.skipped) - 15} more")
+        lines += ["", "Review them on the map, then Generate and Push."
+                  if report.placed else "Push when ready."]
+        QMessageBox.information(self.iface.mainWindow(),
+                                "Field Captures Added" if report.placed
+                                else "No Field Captures Added", "\n".join(lines))
+
     def _execute_push(self, payload):
         """Execute the real push after user confirms in the preview."""
         if self._push_task is not None:
@@ -807,7 +947,12 @@ class LabelOnACablePlugin:
         from qgis.core import QgsApplication
         from .core.tasks import PushTask
 
-        self._push_task = PushTask(self.api, payload)
+        self._push_task = PushTask(
+            self.api, payload,
+            delete_ids=self._pending_delete_ids,
+        )
+        self._pending_delete_ids = []
+        self._push_rebase, self._pending_rebase = self._pending_rebase, None
         self._push_task.taskCompleted.connect(self._on_push_done)
         self._push_task.taskTerminated.connect(self._on_push_done)
         QgsApplication.taskManager().addTask(self._push_task)
@@ -832,11 +977,10 @@ class LabelOnACablePlugin:
             # message or "Operation timeout") but still commits the data.
             # Only treat as hard failure when we never got a response
             # (client-side timeout / connection error) or the status
-            # indicates a proxy/gateway issue (502-504).
-            err_lower = task.error.lower()
+            # indicates a proxy/gateway issue (502-504).  Decided by the
+            # error type, not its wording ("timed out" vs "timeout").
             is_hard_failure = (
-                ("timeout" in err_lower and not task.status_code)
-                or "connection" in err_lower
+                getattr(task, "network_error", False)
                 or task.status_code in (502, 503, 504)
             )
 
@@ -865,12 +1009,44 @@ class LabelOnACablePlugin:
 
         # Stamp payload IDs onto layer features so subsequent pushes
         # are treated as updates rather than creates.
-        from .core.export_builder import stamp_ids_after_push
-        stamp_ids_after_push(task.payload)
-
-        self.iface.messageBar().pushSuccess(
-            self.PLUGIN_NAME, task.message or "Push complete."
+        from .core.export_builder import (
+            payload_loc_ids, remember_loc_ids, stamp_ids_after_push,
         )
+        stamp_ids_after_push(task.payload)
+        # The pulled copies move forward to what the user pushed.
+        rebase, self._push_rebase = self._push_rebase, None
+        if rebase is not None and rebase.base_updates:
+            from qgis.core import QgsProject, QgsVectorLayer
+            from .core.rebase import apply_base_updates
+            layers = [QgsProject.instance().mapLayer(lm.layer_id)
+                      for lm in self.layer_mappings]
+            apply_base_updates([l for l in layers if isinstance(l, QgsVectorLayer)],
+                               rebase.base_updates)
+        remember_loc_ids(task.payload.get("location_id", ""),
+                         payload_loc_ids(task.payload),
+                         forget=task.deleted_ids)
+
+        message = task.message or "Push complete."
+        if task.deleted_ids:
+            message += (f" {len(task.deleted_ids)} LOC(s) moved to the "
+                        "recycle bin.")
+        if task.not_deleted:
+            QMessageBox.warning(
+                self.iface.mainWindow(),
+                "Some LOCs Were Not Deleted",
+                f"The push succeeded, but {len(task.not_deleted)} of the "
+                f"{len(task.delete_ids)} LOC(s) you deleted are still in "
+                "LOC:\n\n"
+                + "\n".join(f"  - {i}" for i in task.not_deleted[:15])
+                + (f"\n  ... and {len(task.not_deleted) - 15} more"
+                   if len(task.not_deleted) > 15 else "")
+                + (f"\n\nServer answer: {task.delete_error}"
+                   if task.delete_error else "")
+                + "\n\nDelete them in LOC, or push again.",
+            )
+            self.iface.messageBar().pushWarning(self.PLUGIN_NAME, message)
+        else:
+            self.iface.messageBar().pushSuccess(self.PLUGIN_NAME, message)
         self._open_loc_page()
 
     def _open_loc_page(self):
@@ -900,6 +1076,9 @@ class LabelOnACablePlugin:
             )
             return
 
+        if not self._confirm_full_pull():
+            return
+
         from .ui.pull_dialog import PullDialog
 
         dlg = PullDialog(
@@ -917,6 +1096,54 @@ class LabelOnACablePlugin:
                 c.category_id: c for c in dlg._categories
             }
 
+    def _confirm_full_pull(self) -> bool:
+        """Before a pull over a mapping in use: a pull adds a full copy of
+        the location as new "(LOC)" layers and moves the mapping onto
+        them.  Over the user's own layers that silently cost Brandon his
+        mapping (15 Nov 2026), so say so, point at Pull now for field
+        captures, and keep the mapping as a preset to load back."""
+        from qgis.core import QgsProject, QgsVectorLayer
+        project = QgsProject.instance()
+        live = [(lm, project.mapLayer(lm.layer_id)) for lm in self.layer_mappings]
+        live = [(lm, l) for lm, l in live if isinstance(l, QgsVectorLayer)]
+        if not live:
+            return True
+        own = [lm for lm, l in live if l.fields().indexOf("_loc_id") < 0]
+        preset = ""
+        if own:
+            from datetime import datetime
+            from .models.mapping import MappingPreset, save_preset
+            preset = (f"{self.active_location.name} before pull "
+                      f"{datetime.now():%Y-%m-%d %H:%M}")
+            text = (
+                "Category Mapping uses your own layers. Pull adds a full copy "
+                "of this location as new \"(LOC)\" layers and moves the mapping "
+                "onto them; your layers are not changed.\n\n"
+                "To bring in only the assets captured in the field, onto your "
+                "own layers, cancel and click Push to LOC: the Map Is Behind "
+                "LOC prompt offers Pull now.\n\n"
+                f"Your current mapping will be saved as the preset \"{preset}\", "
+                "so you can load it back in Category Mapping.")
+        else:
+            text = (
+                "This project already holds a pull of this location. Pulling "
+                "again adds a second copy as new \"(LOC)\" layers and moves "
+                "the mapping onto them; edits on the current layers that are "
+                "not pushed stay on those layers and are no longer pushed.\n\n"
+                "Remove the old \"(LOC)\" layers after the pull to avoid "
+                "confusion.")
+        box = QMessageBox(QMessageBox.Icon.Question, "Pull a Full Copy?", text,
+                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                          self.iface.mainWindow())
+        box.button(QMessageBox.StandardButton.Yes).setText("Pull a Copy")
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return False
+        if preset:
+            save_preset(MappingPreset(name=preset, layer_mappings=list(self.layer_mappings),
+                                      snap_tolerance=self.snap_tolerance))
+        return True
+
     def _on_pull_complete(self, layers, mappings, pulled_ids,
                           multi_stop_counts=None):
         """Handle imported layers from the pull dialog."""
@@ -925,10 +1152,20 @@ class LabelOnACablePlugin:
         project = QgsProject.instance()
         for layer in layers:
             project.addMapLayer(layer)
+            self._session_pulled_layers.add(layer.id())
 
         self.layer_mappings = mappings
         self._pulled_loc_ids = pulled_ids
+        from .core.field_merge import forget_field_captures
+        forget_field_captures(project)
+        # Remember what this project holds, so a capture-mode push can
+        # tell a LOC deleted here from one captured in the field later.
+        from .core.export_builder import remember_loc_ids
+        if self.active_location is not None:
+            remember_loc_ids(self.active_location.location_id, pulled_ids)
         self._pulled_multi_stop_counts = multi_stop_counts or {}
+        from .core.export_builder import set_layer_mappings
+        set_layer_mappings(mappings)
 
         # Auto-reconstruct routes from pulled layer geometry so the user
         # can review/push without running the snapping-based generator
@@ -998,6 +1235,15 @@ class LabelOnACablePlugin:
             self.active_location.location_id,
             self.layer_mappings,
         )
+        # The matched server records are now held by this project, so a
+        # capture-mode push may delete them once they are removed here.
+        from .core.export_builder import remember_loc_ids, server_loc_index
+        unmatched = set(report.unmatched_server)
+        remember_loc_ids(self.active_location.location_id, [
+            lid for lid, (uid, ltype) in server_loc_index(task.locs_data).items()
+            if (uid, ltype) not in unmatched
+            and (uid or "(no asset ID)", ltype) not in unmatched
+        ])
 
         # A bare "matched N" reads as success even when N is 0 and every
         # server LOC is queued for deletion, so the residual gets a modal

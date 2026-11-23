@@ -1,0 +1,18 @@
+[run]
+source = label_on_a_cable
+branch = True
+concurrency = thread
+
+[report]
+show_missing = True
+skip_empty = True
+precision = 1
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+
+[html]
+directory = tests/reports/coverage_html
+
+[xml]
+output = tests/reports/coverage.xml

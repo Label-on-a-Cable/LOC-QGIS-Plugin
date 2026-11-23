@@ -48,6 +48,7 @@ class PointLayerConfig:
     layer: QgsVectorLayer
     name_field: str                 # QGIS attribute field for structure name
     default_stop_type: StopType     # category-level default
+    id_field: str = ""              # asset ID field: the name when it is empty
 
 
 # ------------------------------------------------------------------
@@ -179,6 +180,7 @@ def _resolve_configs(
                 layer=layer,
                 name_field=name_field,
                 default_stop_type=stop_type,
+                id_field=lm.qgis_field_for("Unique Asset Identifier"),
             ))
 
     return line_configs, point_configs
@@ -338,9 +340,14 @@ def _build_route_for_feature(
             if perp_dist > snap_tolerance:
                 continue
 
-            struct_name = (
-                str(pt_feat[cfg.name_field]) if cfg.name_field else ""
-            )
+            # An empty name (a structure captured in the field without
+            # one) made the stop "CBL-001_None"; use its asset ID instead.
+            struct_name = ""
+            for fld in (cfg.name_field, cfg.id_field):
+                val = pt_feat[fld] if fld else None
+                if val is not None and str(val).strip() not in ("", "NULL"):
+                    struct_name = str(val).strip()
+                    break
             candidates.append((dist_along, struct_name, cfg, pt_feat))
 
     if not candidates:

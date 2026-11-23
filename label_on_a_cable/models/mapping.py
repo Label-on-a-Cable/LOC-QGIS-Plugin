@@ -12,6 +12,10 @@ from qgis.core import QgsSettings
 
 _PRESETS_KEY = "LOC/mapping_presets"
 
+# A stop's identity comes from the structure point and the reviewed
+# label, never from the line feature, so these are never stop fields.
+STOP_IDENTITY_FIELDS = {"unique asset identifier", "actual asset name"}
+
 
 @dataclass
 class FieldMapping:

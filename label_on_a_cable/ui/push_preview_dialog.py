@@ -163,11 +163,13 @@ class PushPreviewDialog(QDialog):
             return
 
         if task.error:
-            err_lower = task.error.lower()
-            is_server_error = ("timeout" in err_lower
-                               or "500" in task.error
-                               or "502" in task.error
-                               or "503" in task.error)
+            # Block Push when the dry run got no answer at all (timeout /
+            # connection error) or the server itself failed (5xx).  Decided
+            # by error type and status, not by words in the message.
+            is_server_error = (
+                getattr(task, "network_error", False)
+                or (task.status_code or 0) >= 500
+            )
 
             detail_parts = push_diagnostics(task)
             detail_parts.append(
@@ -256,10 +258,8 @@ def _pretty_key(key: str) -> str:
     spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", key)
     # Replace underscores/hyphens with spaces
     spaced = spaced.replace("_", " ").replace("-", " ")
-    # Title-case, then restore known acronyms
-    result = spaced.title()
-    for acronym in ("Loc", "Locs", "Id", "Uuid", "Api", "Url"):
-        result = result.replace(acronym, acronym.upper())
-    # Fix "LOCS" → "LOCs"
-    result = result.replace("LOCS", "LOCs")
-    return result
+    # Title-case, then restore known acronyms — whole words only, so
+    # "Location" / "Identifier" are left alone.
+    acronyms = {"Loc": "LOC", "Locs": "LOCs", "Id": "ID", "Uuid": "UUID",
+                "Api": "API", "Url": "URL"}
+    return " ".join(acronyms.get(w, w) for w in spaced.title().split())

@@ -37,6 +37,7 @@ from ..core.route_generator import DEFAULT_SNAP_TOLERANCE
 from ..core.tasks import FetchCategoriesTask
 from ..models.category import Category
 from ..models.mapping import (
+    STOP_IDENTITY_FIELDS,
     FieldMapping,
     LayerMapping,
     MappingPreset,
@@ -478,6 +479,16 @@ class _LayerRow:
             sc_row.addWidget(self._stop_cat_combo)
             self._detail_layout.addLayout(sc_row)
 
+            # Shown once a stop category is chosen: the identity fields are
+            # deliberately missing from the combos below (see
+            # _rebuild_stop_field_combos), so say where they come from.
+            self._stop_hint = QLabel(self._STOP_HINT)
+            self._stop_hint.setStyleSheet("color: gray; font-size: 11px;")
+            self._stop_hint.setWordWrap(True)
+            self._stop_hint.setContentsMargins(20, 0, 0, 0)  # indent
+            self._stop_hint.setVisible(False)
+            self._detail_layout.addWidget(self._stop_hint)
+
             # Indented stop field mappings (built when stop category changes)
             self._stop_fields_widget = QWidget()
             stop_outer = QHBoxLayout(self._stop_fields_widget)
@@ -567,6 +578,13 @@ class _LayerRow:
     # Stop category field mapping (line layers only)
     # ------------------------------------------------------------------
 
+    _STOP_HINT = (
+        "Stop name and ID come from the structure point and the Route "
+        "Review dialog. Only the stop category's other fields are mapped "
+        "here, from the line layer's attributes."
+    )
+    _STOP_HINT_EMPTY = _STOP_HINT + " This stop category has no other fields."
+
     def _rebuild_stop_field_combos(self, cat: Optional[Category]):
         """Rebuild field combos for the stop category."""
         # Clear old combos
@@ -576,30 +594,20 @@ class _LayerRow:
                 w.deleteLater()
         self._stop_field_combos.clear()
 
+        self._stop_hint.setVisible(cat is not None)
         if cat is None:
             return
 
-        all_fields = cat.fields
-        # Stop essentials: only Actual Asset Name — Unique Asset Identifier
-        # is always resolved from the point feature automatically.
-        essentials = ["Actual Asset Name"]
-        existing = {cf.name.lower() for cf in all_fields}
-
-        # Inject essential fields if missing from category definition
-        for ename in essentials:
-            if ename.lower() not in existing:
-                self._add_stop_field_combo(
-                    f"<b>{ename}</b> (required):", ename
-                )
-
-        for cf in all_fields:
-            # Skip Unique Asset Identifier — filled automatically
-            if cf.name.lower() == "unique asset identifier":
+        # A stop's Unique Asset Identifier and Actual Asset Name come from
+        # the structure point and the reviewed label, never from the line
+        # feature these combos read, so neither is offered here.
+        for cf in cat.fields:
+            if cf.name.lower() in STOP_IDENTITY_FIELDS:
                 continue
-            label = f"{cf.name}:"
-            if cf.name.lower() in {e.lower() for e in essentials}:
-                label = f"<b>{cf.name}</b> (required):"
-            self._add_stop_field_combo(label, cf.name)
+            self._add_stop_field_combo(f"{cf.name}:", cf.name)
+        # An empty section looks like a mapping that failed to load.
+        self._stop_hint.setText(
+            self._STOP_HINT if self._stop_field_combos else self._STOP_HINT_EMPTY)
 
     def _add_stop_field_combo(self, label: str, loc_field_name: str):
         """Add one stop field mapping row."""
