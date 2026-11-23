@@ -843,23 +843,26 @@ def server_loc_index(locs_data: dict) -> Dict[str, Tuple[str, str]]:
     return index
 
 
-def predict_deletions(
+def _strip_braces(value) -> str:
+    return str(value or "").strip().strip("{}")
+
+
+def _unused_server_locs(
     payload: dict,
     locs_data: dict,
-) -> List[Tuple[str, str]]:
-    """Return ``(unique_asset_id, loc_type)`` for LOCs this push would bin.
-
-    Mirrors the server's per-bucket matching (see the section note above)
-    so the prediction matches what ``sweepDeletes`` will actually do.
+) -> List[Tuple[str, str, str]]:
+    """``(loc_id, unique_asset_id, loc_type)`` of every server LOC the
+    payload does not account for, following the server's matching rules
+    (loc-next v1.29.1): routed cables and stops by ``loc_id``; standalone
+    structures and cables by ``loc_id`` when the payload carries one the
+    location holds, else by ``unique_asset_id``.
     """
     index = server_loc_index(locs_data)
     if not index:
         return []
 
-    # Reverse lookups for the unique_asset_id-matched buckets.  The server
-    # searches by (uniqueAssetId, locType) within the location, so a stop
-    # single is a legitimate match for a standalone single push — index
-    # every LOC of the right type, not just the standalone ones.
+    # The server searches by (uniqueAssetId, locType) within the location,
+    # so a stop single is a legitimate match for a standalone single push.
     by_uid: Dict[Tuple[str, str], str] = {}
     for lid, (uid, ltype) in index.items():
         if uid:
@@ -867,34 +870,155 @@ def predict_deletions(
 
     used: set = set()
 
-    for sl in payload.get("single_locs", []):
-        lid = by_uid.get((sl.get("unique_asset_id", ""), "single"))
-        if lid:
+    def standalone(lid: str, uid: str, ltype: str) -> None:
+        lid = _strip_braces(lid)
+        if lid and index.get(lid, ("", ""))[1] == ltype:
             used.add(lid)
+            return
+        hit = by_uid.get((uid or "", ltype))
+        if hit:
+            used.add(hit)
+
+    for sl in payload.get("single_locs", []):
+        attrs = sl.get("attributes") or {}
+        standalone(attrs.get("loc_id", ""), sl.get("unique_asset_id", ""), "single")
 
     for dl in payload.get("dual_locs", []):
-        lid = by_uid.get((dl.get("unique_asset_id", ""), "dual"))
-        if lid:
-            used.add(lid)
+        standalone(dl.get("loc_id", ""), dl.get("unique_asset_id", ""), "dual")
 
     for ml in payload.get("multiLocs", []):
         dual_loc = ml.get("dualLoc", {})
-        lid = dual_loc.get("loc_id", "") if isinstance(dual_loc, dict) else ""
+        lid = _strip_braces(dual_loc.get("loc_id", "") if isinstance(dual_loc, dict) else "")
         if lid and index.get(lid, ("", ""))[1] == "dual":
             used.add(lid)
         for stop in ml.get("Stops", []):
             sloc = stop.get("singleLoc", {})
-            slid = sloc.get("loc_id", "") if isinstance(sloc, dict) else ""
+            slid = _strip_braces(sloc.get("loc_id", "") if isinstance(sloc, dict) else "")
             if slid and index.get(slid, ("", ""))[1] == "single":
                 used.add(slid)
 
-    doomed = [
-        (uid or "(no asset ID)", ltype)
-        for lid, (uid, ltype) in index.items()
-        if lid not in used
-    ]
-    doomed.sort()
-    return doomed
+    out = [(lid, uid, ltype) for lid, (uid, ltype) in index.items()
+           if lid not in used]
+    out.sort(key=lambda t: (t[1], t[2], t[0]))
+    return out
+
+
+def predict_deletions(
+    payload: dict,
+    locs_data: dict,
+) -> List[Tuple[str, str]]:
+    """Return ``(unique_asset_id, loc_type)`` for LOCs this push would bin
+    in a location whose push replaces everything (no capture mode)."""
+    return [(uid or "(no asset ID)", ltype)
+            for _lid, uid, ltype in _unused_server_locs(payload, locs_data)]
+
+
+class DeletionPlan:
+    """What a push removes from LOC, and how.
+
+    ``delete``  ``(loc_id, asset id, type)`` the user removed in QGIS — the
+                prompt names them and the push task makes sure they leave
+                LOC: the server bins them itself in a normal project, the
+                plugin bins them in a capture-mode project, and the task
+                checks afterwards either way.
+    ``kept``    capture mode only: server LOCs this project has never held
+                (captured in the field since the last pull).  LOC keeps them.
+    """
+
+    def __init__(self, delete, kept, capture_mode, known):
+        self.delete = delete
+        self.kept = kept
+        self.capture_mode = capture_mode
+        self.known = known
+
+    @property
+    def doomed(self) -> List[Tuple[str, str]]:
+        return [(uid or "(no asset ID)", ltype) for _l, uid, ltype in self.delete]
+
+    @property
+    def delete_ids(self) -> List[str]:
+        return [lid for lid, _u, _t in self.delete]
+
+
+def plan_deletions(
+    payload: dict,
+    locs_data: dict,
+    capture_mode: Optional[bool],
+    known_ids: Optional[set],
+) -> DeletionPlan:
+    """Split the LOCs a push leaves out into those to delete and those LOC
+    keeps.
+
+    A normal project: the push replaces the location, so everything left
+    out is deleted.  A capture-mode project (loc-next M0.5, merge push):
+    the server deletes nothing, so only records this project knows —
+    pulled or pushed from it, *known_ids* — and that the user removed are
+    deleted, by the plugin; field captures newer than the last pull stay.
+    With no record of what the project knows (pulled with plugin 1.7.1 or
+    older) every left-out record is listed, as before, and deleted only if
+    the user confirms the list.
+    """
+    unused = _unused_server_locs(payload, locs_data)
+    if not capture_mode or known_ids is None:
+        return DeletionPlan(unused, [], bool(capture_mode), known_ids is not None)
+    delete = [u for u in unused if u[0] in known_ids]
+    kept = [u for u in unused if u[0] not in known_ids]
+    return DeletionPlan(delete, kept, True, True)
+
+
+def payload_loc_ids(payload: dict) -> set:
+    """Every loc_id a payload carries (standalone, route cables, stops)."""
+    ids = set()
+    for sl in payload.get("single_locs", []):
+        lid = _strip_braces((sl.get("attributes") or {}).get("loc_id", ""))
+        if lid:
+            ids.add(lid)
+    for dl in payload.get("dual_locs", []):
+        lid = _strip_braces(dl.get("loc_id", ""))
+        if lid:
+            ids.add(lid)
+    for ml in payload.get("multiLocs", []):
+        dual_loc = ml.get("dualLoc") or {}
+        lid = _strip_braces(dual_loc.get("loc_id", ""))
+        if lid:
+            ids.add(lid)
+        for stop in ml.get("Stops", []):
+            slid = _strip_braces((stop.get("singleLoc") or {}).get("loc_id", ""))
+            if slid:
+                ids.add(slid)
+    return ids
+
+
+# Records a project has held, per location, kept in the stamp cache file
+# under its own top-level key.  A capture-mode push deletes only these.
+_KNOWN_KEY = "_known_loc_ids"
+
+
+def known_loc_ids(location_id: str) -> Optional[set]:
+    """loc_ids this project has pulled or pushed for *location_id*, or
+    None when it has never recorded any (pulled with 1.7.1 or older)."""
+    if not location_id:
+        return None
+    ledger = _load_stamp_cache().get(_KNOWN_KEY)
+    if not isinstance(ledger, dict) or location_id not in ledger:
+        return None
+    return set(ledger.get(location_id) or [])
+
+
+def remember_loc_ids(location_id: str, ids, forget=()) -> None:
+    """Add *ids* to (and drop *forget* from) the project's known records."""
+    if not location_id:
+        return
+    cache = _load_stamp_cache()
+    ledger = cache.get(_KNOWN_KEY)
+    if not isinstance(ledger, dict):
+        ledger = {}
+    known = set(ledger.get(location_id) or [])
+    known |= {i for i in ids if i}
+    known -= set(forget)
+    ledger[location_id] = sorted(known)
+    cache[_KNOWN_KEY] = ledger
+    _save_stamp_cache(cache)
 
 
 def audit_export_coverage(
@@ -2292,12 +2416,19 @@ def _rebuild_stops_from_raw(
         coord_key = (round(pt_xy[0], 8), round(pt_xy[1], 8))
         if (matched_entry is None and can_seq_fallback
                 and idx - 1 < len(sorted_orig)
-                and id(sorted_orig[idx - 1]) not in claimed):
+                and id(sorted_orig[idx - 1]) not in claimed
+                and pt_feature is not None
+                and _safe_value(pt_feature, "_loc_id")):
             # Sequential fallback: standalone singleLOC coordinates
             # can differ from stop singleLoc coordinates on the server.
             # When stop counts match, reconstruction preserved order
             # from line vertices, so the Nth intermediate is the Nth
-            # original stop.
+            # original stop.  Only a *pulled* structure (it carries its
+            # record's _loc_id) can be an original stop that merely
+            # moved; a structure drawn after the pull is a new stop even
+            # when a removed stop left the count unchanged — otherwise it
+            # silently took the removed stop's record (staging Howth
+            # OM_FIB_4_4, 6 Nov 2026).
             matched_entry = sorted_orig[idx - 1]
             claimed.add(id(matched_entry))
             used_stop_ids.add(matched_entry.get("stop_id"))
@@ -2358,6 +2489,16 @@ def _rebuild_stops_from_raw(
                     route_uid + orig_uid[len(old_route_uid):])
                 patched_sloc["updatedAt"] = now
             patched_sloc["location_id"] = location.location_id
+
+            # LOC creates a stop it no longer holds (deleted on the web
+            # since the pull, a backup pushed back) from category_name
+            # alone, and the pulled record carries only the category id —
+            # without this the stop came back with no category (Bug 28).
+            # A stop with no category (LOC's Default) stays that way.
+            if not patched_sloc.get("category_name"):
+                raw_cat = categories.get(str(orig_sloc.get("category") or ""))
+                if raw_cat is not None:
+                    patched_sloc["category_name"] = raw_cat.name
 
             # If stopNumber changed, bump updatedAt and patch name
             orig_snum = matched_entry.get("stopNumber", 0)

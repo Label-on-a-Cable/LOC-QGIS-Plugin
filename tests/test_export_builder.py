@@ -916,6 +916,54 @@ class TestPulledRoundTrip:
         assert len(set(lids)) == len(lids)
         assert eb.validate_payload(payload) == []
 
+    def test_new_structure_does_not_take_a_removed_stops_record(self, tmp_path):
+        """Staging Howth OM_FIB_4_4 (6 Nov 2026): remove stop 1 in Route
+        Review and add a structure right after it.  The counts matched, so
+        the sequential fallback handed the removed stop's server record to
+        the new stop: nothing deleted, nothing created, and the new
+        structure pushed under the removed stop's name, loc_id and stop_id
+        (moving its statuses, notes and photos to another structure)."""
+        p = pulled_network(tmp_path)
+        poles, cables = p.layers["Pole (LOC)"], p.layers["Fiber Cable (LOC)"]
+        routes = ib.reconstruct_routes(p.maps, skip_snapping=True)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        first, second = r.intermediate_stops[0], r.intermediate_stops[1]
+
+        def xy(stop):
+            lyr = QgsProject.instance().mapLayer(stop.point_layer_id)
+            return lyr.getFeature(stop.point_feature_id).geometry().asPoint()
+        verts = feature_where(cables, "Route ID", "CBL-001").geometry().asPolyline()
+        ia = next(i for i, v in enumerate(verts) if v.compare(xy(first), 1e-9))
+        ib_ = next(i for i, v in enumerate(verts) if v.compare(xy(second), 1e-9))
+        a, b = verts[ia], verts[ib_]
+        nf = QgsFeature(poles.fields())
+        nf.setGeometry(QgsGeometry.fromPointXY(
+            QgsPointXY((a.x() + b.x()) / 2, (a.y() + b.y()) / 2)))
+        nf.setAttribute("Unique Asset Identifier", "P-NEW")
+        nf.setAttribute("Actual Asset Name", "New Pole")
+        assert poles.dataProvider().addFeatures([nf])[0]
+
+        routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        assert [s.structure_name for s in r.intermediate_stops[:2]] == [first.structure_name, "New Pole"]
+        r.intermediate_stops[0].removed = True
+        raw = self._raw_stops(p)
+        removed_lid = next(lid for lid, e in raw.items()
+                           if e["singleLoc"]["unique_asset_id"].endswith(first.structure_name))
+        payload = build_pulled(p, routes)
+        stops = payload["multiLocs"][0]["Stops"]
+        lids = [s["singleLoc"]["loc_id"] for s in stops]
+        assert removed_lid not in lids                         # the removed stop goes
+        new = [s for s in stops if s["singleLoc"]["loc_id"] not in raw]
+        assert len(new) == 1 and "New Pole" in new[0]["singleLoc"]["unique_asset_id"]
+        # (the removed stop's now-free stop_id slot may be reused: Stop rows
+        # are rebuilt wholesale on every push, the record is what matters)
+        assert payload["_test_doomed"] == [
+            (raw[removed_lid]["singleLoc"]["unique_asset_id"], "single")]
+        # everything else keeps its record
+        assert [lid for lid in lids if lid in raw] == [
+            lid for lid in raw if lid != removed_lid]
+
     def test_new_stop_gets_unique_stop_id(self, tmp_path):
         _, payload = self._edit_pulled_route(
             tmp_path, remove=("Pole 2", "Pole 3"), add_pole=True)
@@ -1266,6 +1314,25 @@ class TestPulledRoundTrip:
         cables.dataProvider().changeAttributeValues(
             {f.id(): {cables.fields().indexOf("Route ID"): "CBL-001A"}})
         assert build_pulled(p)["multiLocs"][0]["multiName"] == "CBL-001A"
+
+    def test_rebuilt_stop_carries_its_category_name(self, tmp_path):
+        """Bug 28 (Tempe Campus › test, 5 Nov 2026): the real API returns
+        a stop's category id only, and LOC creates a stop it no longer
+        holds (deleted on the web after the pull, a backup pushed back)
+        from category_name alone — so the stop came back with no
+        category.  A stop that has no category (LOC's Default) stays so."""
+        def mutate(data):
+            for m in data["multiLoc"]:
+                for s in m["Stops"]:
+                    s["singleLoc"].pop("category_name", None)
+                    s["singleLoc"].pop("category_type", None)
+            data["multiLoc"][0]["Stops"][-1]["singleLoc"]["category"] = None
+        p = pulled_network(tmp_path, mutate)
+        stops = [s["singleLoc"] for s in build_pulled(p)["multiLocs"][0]["Stops"]]
+        assert len(stops) == 4
+        for sl in stops[:-1]:
+            assert sl["category_name"] == p.cats[sl["category"]].name
+        assert stops[-1]["category"] is None and "category_name" not in stops[-1]
 
     def test_variant_keys_normalised(self, tmp_path):
         def mutate(data):

@@ -1,11 +1,11 @@
 [general]
 name=Label on a Cable - KelTech IoE
 qgisMinimumVersion=3.22
+qgisMaximumVersion=4.99
 description=Generate, synchronise and manage infrastructure asset labels with the LOC platform.
 version=1.7.1
 author=Brandon Kellett, KelTech IoE
 email=loc@keltechioe.com
-supportsQt6=True
 about=Authenticate to LOC, select a Location, and automatically generate infrastructure labels directly from your QGIS designs, eliminating manual label creation. The plugin enables bidirectional data flow between QGIS and LOC. Pull high-accuracy field data captured by engineers using mobile devices or GNSS receivers to update asset positions in your GIS project. Push bulk attribute updates (such as cable lengths or metadata) from QGIS back into LOC to keep your digital records aligned with real-world installations. Designed to significantly accelerate labelling workflows while improving spatial accuracy and data consistency across design and field operations.
 tracker=https://github.com/Label-on-a-Cable/LOC-QGIS-Plugin/issues
 repository=https://github.com/Label-on-a-Cable/LOC-QGIS-Plugin
@@ -27,4 +27,15 @@ changelog=
     - Unedited pull and push no longer reports phantom created or updated LOCs
     - Stops added in the LOC app without a structure stay on their route after a pull
     - Pulled fields keep their values when a record also holds an old numbered copy
+    - A stop that LOC has to re-create after a pull keeps its category
+    - A structure added where a stop was removed gets its own record instead of the removed stop's
+    - Deleting LOCs in QGIS now removes them from LOC in capture-mode projects, and the push confirms they are gone
+    - LOCs deleted from QGIS now appear in the location's history in LOC
+    - A push keeps changes made in LOC since your last pull, including stops added to routes on site, and asks when the same value was changed in both places
+    - Before a push, the plugin lists what changed in LOC since your last pull, and Pull now adds assets captured in the field to your mapped layers without changing your mapping
+    - Pull asks before adding a second copy of the location and keeps your Category Mapping as a preset
+    - Pushing pulled layers that QGIS emptied on closing is refused instead of deleting their LOCs
+    - Stops on structures without a name are named from the asset ID
+    - Pulling a location with uncategorised LOCs no longer stops with an error
+    - Correcting a structure's asset ID no longer warns that it will be deleted
     - Clearer errors for timed-out and oversized pushes

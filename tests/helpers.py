@@ -45,7 +45,20 @@ def wait_until(predicate, timeout_ms=15000, message="condition"):
 def wait_task(task, timeout_ms=15000):
     """Wait for a QgsTask to finish and its signals to be delivered."""
     done = (QgsTask.TaskStatus.Complete, QgsTask.TaskStatus.Terminated)
-    wait_until(lambda: task.status() in done, timeout_ms, f"task {task.description()}")
+    name = task.description()
+
+    def finished():
+        # QgsTaskManager owns the task and deletes the C++ object once it
+        # has finished and its signals are out; a fast task can be gone
+        # before the next poll (the "wrapped C/C++ object … has been
+        # deleted" flake).  Deleted means finished.  The Python-side
+        # attributes the tests read stay valid.
+        try:
+            return task.status() in done
+        except RuntimeError:
+            return True
+
+    wait_until(finished, timeout_ms, f"task {name}")
     pump(20)
 
 

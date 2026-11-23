@@ -750,6 +750,8 @@ def reconstruct_routes(
 
     merged_routes: List[Route] = []
     reconstructed_keys: set = set()
+    from .field_merge import field_capture_ids
+    captures = field_capture_ids(project)
 
     for route in routes:
         key = (route.line_layer_id, route.line_feature_id)
@@ -768,13 +770,17 @@ def reconstruct_routes(
             # structure drawn in QGIS is the user's edit wherever it is,
             # even dropped exactly onto an existing stop.  Stops already
             # on the route stay: they anchor where new stops go.
+            # A field capture placed by Pull now is the exception: LOC
+            # had not put it on any route yet, so it joins like a
+            # structure drawn in QGIS (unless it sits on a stop or end).
             snap_route.stops = [
                 s for s in snap_route.stops
                 if s.is_endpoint
                 or (s.point_layer_id, s.point_feature_id) in on_route
                 or not (_is_pulled_point(project, s)
                         and (_point_key(project, s, line_crs) in taken
-                             or _is_unmoved_pulled_point(project, s)))
+                             or (_is_unmoved_pulled_point(project, s)
+                                 and not _is_field_capture(project, s, captures))))
             ]
             merged = _merge_stops(route, snap_route)
             if merged:
@@ -832,6 +838,14 @@ def _pulled_point_feature(project, stop: Stop):
     if not _safe_feat_attr(feat, "_loc_id"):
         return None
     return feat
+
+
+def _is_field_capture(project, stop: Stop, captures) -> bool:
+    """The stop's structure was added by Pull now (see field_merge)."""
+    if not captures:
+        return False
+    feat = _pulled_point_feature(project, stop)
+    return feat is not None and str(_safe_feat_attr(feat, "_loc_id")) in captures
 
 
 def _is_pulled_point(project, stop: Stop) -> bool:

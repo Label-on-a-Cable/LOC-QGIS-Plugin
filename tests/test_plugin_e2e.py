@@ -15,6 +15,8 @@ from qgis.PyQt.QtWidgets import QMessageBox, QPushButton
 
 import label_on_a_cable
 from fake_loc_server import LOCATION_ID, OTHER_LOCATION_ID
+from helpers import CAT_POLE
+from fake_loc_server import CAT_CHAMBER, CAT_STOPS
 from helpers import (
     ITM, build_network, location_items, network_mappings, pump, save_project,
     seed_server, wait_task, wait_until,
@@ -32,6 +34,8 @@ from label_on_a_cable.ui.push_preview_dialog import PushPreviewDialog
 from label_on_a_cable.ui.user_details_dialog import UserDetailsDialog
 
 YES, NO = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
+# "Map Is Behind LOC": Yes = Pull now, Ignore = Push anyway
+PUSH_ANYWAY, CANCEL = QMessageBox.StandardButton.Ignore, QMessageBox.StandardButton.Cancel
 
 pytestmark = pytest.mark.e2e
 
@@ -456,29 +460,28 @@ class TestPush:
         assert server_ids(ui.server) == ids
         assert ui.server.push_count == 2
 
-    def test_renamed_standalone_structure_warns_before_replacing_it(self, ui):
-        """LOC matches standalone records by asset id, so a corrected id
-        is a delete + create on the server whatever the plugin sends
-        (staging dry run, 5 Nov 2026).  The push must say so first."""
+    def test_renamed_standalone_structure_keeps_its_record(self, ui):
+        """loc-next v1.29.1 (B2, on production 9 Nov 2026) finds a
+        standalone record by loc_id first, so a corrected asset id is an
+        update of the same record.  The plugin used to predict the old
+        rule's delete + create and showed a false "LOCs Will Be Deleted"
+        (follow-up F5)."""
         layers = design_project(ui)
         generate(ui)
         push(ui)
+        p5_lid = next(lid for lid, s in ui.server.loc_state()["single"].items()
+                      if s["unique_asset_id"] == "P5")
         poles = layers["poles"]
         fid = [f.id() for f in poles.getFeatures() if f["PoleID"] == "P5"][0]
         poles.dataProvider().changeAttributeValues(
             {fid: {poles.fields().indexOf("PoleID"): "P5A"}})
         generate(ui)
-        ui.msgbox.answers = [NO]
-        start_push(ui)
-        kind, title, text = ui.msgbox.calls[-1]
-        assert (kind, title) == ("warning", "LOCs Will Be Deleted")
-        assert "  - P5  (single)" in text
-        assert ui.server.push_count == 1                 # declined: nothing sent
         push(ui)
+        assert "LOCs Will Be Deleted" not in ui.msgbox.titles()
         stats = last_preview_stats(ui)
-        assert (stats["Created LOCs"], stats["Deleted LOCs"]) == ("1", "1")
-        uids = {s["unique_asset_id"] for s in ui.server.loc_state()["single"].values()}
-        assert "P5A" in uids and "P5" not in uids
+        assert (stats["Created LOCs"], stats["Deleted LOCs"]) == ("0", "0")
+        single = ui.server.loc_state()["single"]
+        assert single[p5_lid]["unique_asset_id"] == "P5A"
 
     def test_attribute_edit_pushes_one_update(self, ui):
         layers = design_project(ui)
@@ -512,12 +515,799 @@ class TestPush:
         assert stats["Deleted LOCs"] == "3"   # P5 + P3 single + P3 route stop
         uids = {s["unique_asset_id"] for s in ui.server.loc_state()["single"].values()}
         assert uids == {"P1", "P2", "P4", "CH1"}
+        # A normal project: the server's sweep did it; the check agrees.
+        assert ui.server.requests_to("LOCs/delete-many", "DELETE") == []
+        assert "Some LOCs Were Not Deleted" not in ui.msgbox.titles()
 
     def test_cancel_preview_pushes_nothing(self, ui):
         design_project(ui)
         generate(ui)
         push(ui, confirm=False)
         assert ui.server.push_count == 0 and ui.urls == []
+
+
+class TestCaptureModeDeletes:
+    """A project in LOC capture mode (every production project, 9 Nov
+    2026) merges pushes: the server deletes nothing a push leaves out
+    (loc-next M0.5).  Reported the same day: "I deleted some LOCs on my
+    QGIS map and the plugin flags that they will get deleted. Yet when I
+    push, they don't get deleted in LOC."  The plugin now bins what the
+    user removed itself and checks afterwards; field captures it never
+    held stay."""
+
+    def _capture(self, ui):
+        ui.server.capture_projects.add("p-1")
+
+    def _uids(self, ui):
+        return {s["unique_asset_id"] for s in ui.server.loc_state()["single"].values()}
+
+    def _delete_poles(self, layers, *ids):
+        poles = layers["poles"]
+        poles.dataProvider().deleteFeatures(
+            [f.id() for f in poles.getFeatures() if f["PoleID"] in ids])
+
+    def _prompt(self, ui):
+        return [c for c in ui.msgbox.calls if c[1] == "LOCs Will Be Deleted"]
+
+    def test_server_alone_keeps_what_the_push_leaves_out(self, ui):
+        """The bug, at the server: a merge push deletes nothing."""
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        payload = json.loads(json.dumps(ui.server.requests_to(
+            "LOCs/plugin-v3", "POST")[-1]["body"]))
+        payload["single_locs"] = [s for s in payload["single_locs"]
+                                  if s["unique_asset_id"] != "P5"]
+        ui.server._apply_push(LOCATION_ID, payload)
+        assert "P5" in self._uids(ui)
+
+    def test_deleted_structures_leave_loc(self, ui):
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._delete_poles(layers, "P5", "P3")
+        generate(ui)
+        push(ui)
+        (prompt,) = self._prompt(ui)
+        assert "You removed 3 LOC(s) in QGIS" in prompt[2]
+        assert "  - P5  (single)" in prompt[2]
+        assert self._uids(ui) == {"P1", "P2", "P4", "CH1"}   # P3's stop LOC too
+        assert len(ui.server.bin) == 3
+        assert any("3 LOC(s) moved to the recycle bin" in t for t in bar(ui))
+        assert "Some LOCs Were Not Deleted" not in ui.msgbox.titles()
+
+    def test_bulk_delete_is_filed_under_the_location_as_plugin_activity(self, ui):
+        """LOC's history showed none of these deletes (12 Nov 2026): the
+        request named no location and looked like the mobile app.  The
+        plugin now says who it is and which location the delete is in."""
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._delete_poles(layers, "P5")
+        generate(ui)
+        push(ui)
+        (req,) = ui.server.requests_to("LOCs/delete-many", "DELETE")
+        assert req["body"]["location_id"] == ui.plugin.active_location.location_id
+        headers = {k.lower(): v for k, v in req["headers"].items()}
+        assert headers.get("x-loc-client") == "qgis-plugin"
+
+    def test_pulled_then_deleted_leaves_loc(self, ui):
+        """The reported flow: pull, delete on the map, push."""
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        from qgis.core import QgsCoordinateReferenceSystem
+        QgsProject.instance().clear()
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(ITM))
+        save_project(ui.tmp, "pulled.qgz")
+        pull(ui)
+        pulled = [l for l in QgsProject.instance().mapLayers().values()
+                  if l.fields().indexOf("_loc_id") >= 0
+                  and any(f["_loc_id"] for f in l.getFeatures())]
+        p5_lid = next(lid for lid, rec in ui.server.loc_state()["single"].items()
+                      if rec["unique_asset_id"] == "P5")
+        layer = next(l for l in pulled
+                     if any(f["_loc_id"] == p5_lid for f in l.getFeatures()))
+        layer.dataProvider().deleteFeatures(
+            [f.id() for f in layer.getFeatures() if f["_loc_id"] == p5_lid])
+        push(ui)
+        assert self._prompt(ui)
+        assert p5_lid not in server_ids(ui.server)
+        assert "P5" not in self._uids(ui)
+        assert any("moved to the recycle bin" in t for t in bar(ui))
+
+    def test_whole_route_deleted_leaves_loc(self, ui):
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        (multi,) = ui.server.loc_state()["multi"].values()
+        route_ids = {multi["dualLoc"]["loc_id"]} | {
+            s["singleLoc"]["loc_id"] for s in multi["Stops"]}
+        cables = layers["cables"]
+        cables.dataProvider().deleteFeatures(
+            [f.id() for f in cables.getFeatures() if f["AssetID"] == "CBL-001"])
+        generate(ui)
+        push(ui)
+        assert self._prompt(ui)
+        assert ui.server.loc_state()["multi"] == {}
+        assert not route_ids & server_ids(ui.server)
+
+    def test_field_captures_since_the_pull_are_kept(self, ui):
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._field_capture(ui)
+        self._delete_poles(layers, "P5")
+        generate(ui)
+        ui.msgbox.answers = [PUSH_ANYWAY]
+        push(ui)
+        (prompt,) = self._prompt(ui)
+        assert "  - P5  (single)" in prompt[2] and "FIELD-1" not in prompt[2]
+        assert "1 other LOC(s) were captured in the field" in prompt[2]
+        assert "FIELD-1" in self._uids(ui) and "P5" not in self._uids(ui)
+
+    def test_nothing_deleted_in_qgis_deletes_nothing(self, ui):
+        self._capture(ui)
+        design_project(ui)
+        generate(ui)
+        push(ui)
+        self._field_capture(ui)
+        ids = server_ids(ui.server)
+        ui.msgbox.answers = [PUSH_ANYWAY]
+        push(ui)
+        assert not self._prompt(ui)
+        assert server_ids(ui.server) == ids and ui.server.bin == []
+
+    def test_project_pulled_with_an_older_plugin(self, ui):
+        """No record of what the project held: list everything left out,
+        say why, delete only on Yes."""
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        cache = eb._load_stamp_cache()
+        cache.pop(eb._KNOWN_KEY, None)
+        eb._save_stamp_cache(cache)
+        ui.plugin._pulled_loc_ids = set()
+        self._delete_poles(layers, "P5")
+        generate(ui)
+        ui.msgbox.answers = [NO]
+        start_push(ui)
+        (prompt,) = self._prompt(ui)
+        assert "older plugin version" in prompt[2]
+        assert "P5" in self._uids(ui)                   # declined: nothing sent
+        push(ui)
+        assert "P5" not in self._uids(ui)
+
+    def test_unreadable_project_switch_still_deletes(self, ui):
+        """The capture switch cannot be read (no project access): the
+        prompt lists what a full replacement would remove, and the task
+        makes sure it is gone whatever the server did."""
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._delete_poles(layers, "P5")
+        generate(ui)
+        ui.server.fail_next["projects/p-1"] = (403, {"message": "Forbidden"}, {})
+        push(ui)
+        (prompt,) = self._prompt(ui)
+        assert "A push replaces the whole location" in prompt[2]
+        assert "P5" not in self._uids(ui)
+
+    def test_failed_delete_is_reported_and_the_push_stands(self, ui):
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._delete_poles(layers, "P5")
+        self._set_height(layers, "P4", "9")
+        generate(ui)
+        ui.server.fail_next["LOCs/delete-many"] = (500, {"message": "boom"}, {})
+        push(ui)
+        assert "Some LOCs Were Not Deleted" in ui.msgbox.titles()
+        text = [c for c in ui.msgbox.calls if c[1] == "Some LOCs Were Not Deleted"][0][2]
+        assert "1 of the 1 LOC(s) you deleted are still in LOC" in text
+        assert "P5" in self._uids(ui)
+        p4 = [s for s in ui.server.loc_state()["single"].values()
+              if s["unique_asset_id"] == "P4"][0]
+        assert p4["fields"]["Height"] == "9"            # the push itself landed
+
+    def test_bulk_delete_refused_falls_back_to_one_by_one(self, ui):
+        """delete-many is all or nothing: one record removed meanwhile
+        (404) refuses the batch, so the task deletes the rest singly."""
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._delete_poles(layers, "P5", "P3")
+        generate(ui)
+        ui.server.fail_next["LOCs/delete-many"] = (
+            404, {"message": "One or more LOCs not found"}, {})
+        push(ui)
+        assert len(ui.server.requests_to("LOCs/delete-many", "DELETE")) == 1
+        assert len([r for r in ui.server.requests if r["method"] == "DELETE"
+                    and not r["path"].endswith("delete-many")]) == 3
+        assert self._uids(ui) == {"P1", "P2", "P4", "CH1"}
+        assert "Some LOCs Were Not Deleted" not in ui.msgbox.titles()
+
+    def _field_capture(self, ui, n=1, category=CAT_POLE):
+        """LOC gains poles captured in the field, unknown to QGIS."""
+        for i in range(1, n + 1):
+            ui.server.loc_state()["single"][f"field-{i}"] = {
+                "loc_id": f"field-{i}", "unique_asset_id": f"FIELD-{i}",
+                "category": category, "fields": {},
+                "origin_longitude": -6.2 + i / 1000, "origin_latitude": 53.3}
+
+    def test_pull_with_an_uncategorised_record_completes(self, ui):
+        """A Default-category record (category null) made the end of the
+        pull crash in the change fingerprint (found 9 Nov 2026 testing
+        Pull now)."""
+        from qgis.core import QgsCoordinateReferenceSystem
+        design_project(ui)
+        generate(ui)
+        push(ui)
+        self._field_capture(ui, category=None)
+        QgsProject.instance().clear()
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(ITM))
+        save_project(ui.tmp, "pulled.qgz")
+        pull(ui)
+        assert any(t.startswith("Imported") for t in bar(ui))
+        assert ui.plugin._last_fingerprint
+
+    # -- stale map: LOC holds field captures this project has never seen --
+
+    STALE = "Map Is Behind LOC"
+
+    def _stale(self, ui):
+        return [c for c in ui.msgbox.calls if c[1] == self.STALE]
+
+    def _pushed_and_captured(self, ui, n=1):
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._field_capture(ui, n)
+        return layers
+
+    def test_stale_map_warns_before_the_push(self, ui):
+        self._pushed_and_captured(ui)
+        posts = len(ui.server.requests_to("LOCs/plugin-v3", "POST"))
+        previews = len(ui.preview_stats)
+        ui.msgbox.answers = [CANCEL]
+        start_push(ui)
+        (warn,) = self._stale(ui)
+        assert warn[0] == "warning"
+        assert warn[2].startswith(
+            "LOC has 1 asset(s) captured in the field since your last pull. "
+            "Pull now adds them to your layers (your mapping and routes stay as "
+            "they are), or push anyway; LOC keeps them either way.")
+        assert "  - FIELD-1  (single)" in warn[2]
+        assert len(ui.preview_stats) == previews            # no preview opened
+        assert len(ui.server.requests_to("LOCs/plugin-v3", "POST")) == posts
+        assert "FIELD-1" in self._uids(ui)
+
+    def test_stale_map_buttons(self, ui):
+        """Pull now (default), Push anyway, Cancel (Escape)."""
+        from label_on_a_cable.ui import reconcile_dialog as rd
+        seen = []
+        ui.msgbox.on_call = None
+        orig = QMessageBox.exec
+
+        def spy(box):
+            sb = QMessageBox.StandardButton
+            seen.append(([box.button(b).text() if box.button(b) else None
+                           for b in (sb.Yes, sb.Ignore, sb.Cancel)],
+                         box.defaultButton() is box.button(sb.Yes),
+                         box.escapeButton() is box.button(sb.Cancel)))
+            return orig(box)
+        QMessageBox.exec = spy
+        try:
+            ui.msgbox.answers = [YES, PUSH_ANYWAY, CANCEL]
+            got = [rd.confirm_stale_map(None, [("F", "single")]) for _ in range(3)]
+        finally:
+            QMessageBox.exec = orig
+        assert got == [rd.STALE_PULL, rd.STALE_PUSH, rd.STALE_CANCEL]
+        assert seen[0] == (["Pull now", "Push anyway", "Cancel"], True, True)
+        assert rd.confirm_stale_map(None, []) == rd.STALE_PUSH   # nothing new: no box
+        assert len(seen) == 3
+        # Only LOC's own changes: nothing to add, so no Pull now.
+        ui.msgbox.answers = [PUSH_ANYWAY]
+        QMessageBox.exec = spy
+        try:
+            assert rd.confirm_stale_map(None, [], changed_in_loc=[("P1", ["Height"])]) \
+                == rd.STALE_PUSH
+        finally:
+            QMessageBox.exec = orig
+        assert seen[3][0] == [None, "Push", "Cancel"]
+
+    def test_stale_map_push_anyway_pushes_and_keeps_field_captures(self, ui):
+        layers = self._pushed_and_captured(ui)
+        self._set_height(layers, "P4", "9")
+        generate(ui)
+        ui.msgbox.answers = [PUSH_ANYWAY]
+        push(ui)
+        assert len(self._stale(ui)) == 1
+        assert not self._prompt(ui)                         # nothing deleted in QGIS
+        p4 = [s for s in ui.server.loc_state()["single"].values()
+              if s["unique_asset_id"] == "P4"][0]
+        assert p4["fields"]["Height"] == "9"
+        assert "FIELD-1" in self._uids(ui) and ui.server.bin == []
+
+    def _layer_ids(self):
+        return sorted(QgsProject.instance().mapLayers())
+
+    def _mapping_dump(self, ui):
+        return [m.to_dict() for m in ui.plugin.layer_mappings]
+
+    def _field_capture_rich(self, ui, n=3):
+        """Field captures as the app stores them: named fields, exact
+        coordinates."""
+        self._field_capture(ui, n)
+        for i in range(1, n + 1):
+            rec = ui.server.loc_state()["single"][f"field-{i}"]
+            rec["actual_asset_name"] = f"Field pole {i}"
+            rec["fields"] = {"Height": str(10 + i), "Material": f"Wood {i}"}
+            rec["origin_longitude"] = -6.4301 - i / 10000
+            rec["origin_latitude"] = 53.5702
+
+    def test_pull_now_adds_field_captures_to_the_design_layers(self, ui):
+        """Brandon, 15 Nov 2026: Pull now pulled the whole location into new
+        "(LOC)" layers and moved the mapping onto them; remapped, every stop
+        was a duplicate and the push was refused, and the full pull had
+        marked the field captures as held here, so a push from the design
+        layers offered to delete them.  Pull now brings in only the three
+        captures, onto the layers mapped to their category."""
+        layers = self._pushed_and_captured(ui, n=0)
+        self._capture(ui)
+        self._field_capture_rich(ui, 3)
+        before_layers, before_map = self._layer_ids(), self._mapping_dump(ui)
+        posts = len(ui.server.requests_to("LOCs/plugin-v3", "POST"))
+        ui.msgbox.answers = [YES]                           # Pull now
+        start_push(ui)
+        (warn,) = self._stale(ui)
+        assert "Pull now adds them to your layers" in warn[2]
+        assert len(ui.server.requests_to("LOCs/plugin-v3", "POST")) == posts
+        assert self._layer_ids() == before_layers           # no "(LOC)" layers
+        assert self._mapping_dump(ui) == before_map         # mapping kept
+        (added,) = [c for c in ui.msgbox.calls if c[1] == "Field Captures Added"]
+        assert "Added 3 asset(s)" in added[2] and "FIELD-2  (Poles)" in added[2]
+        poles = {f["PoleID"]: f for f in layers["poles"].getFeatures()}
+        f1 = poles["FIELD-1"]
+        assert (f1["PoleName"], f1["Height"]) == ("Field pole 1", "11")
+        pt = f1.geometry().asPoint()                        # ITM, not degrees
+        assert 600000 < pt.x() < 800000 and 700000 < pt.y() < 800000
+
+        state = json.loads(json.dumps(ui.server.loc_state()["single"]))
+        generate(ui)
+        push(ui)
+        assert len(self._stale(ui)) == 1                    # no second warning
+        assert not self._prompt(ui)                         # nothing to delete
+        singles = ui.server.loc_state()["single"]
+        assert sorted(r["unique_asset_id"] for r in singles.values()).count("FIELD-1") == 1
+        assert len(singles) == len(state)                   # no duplicates
+        for i in (1, 2, 3):
+            got, was = singles[f"field-{i}"], state[f"field-{i}"]
+            assert got["fields"] == was["fields"]
+            # Photos: loc-next keeps them apart from the pushed record, so
+            # a push cannot touch them; the fake server does not model that.
+            assert abs(float(got["origin_longitude"]) - was["origin_longitude"]) < 1e-7
+            assert abs(float(got["origin_latitude"]) - was["origin_latitude"]) < 1e-7
+
+    def test_pull_now_then_delete_a_capture_removes_it(self, ui):
+        """An added capture is held by the project like any pulled record:
+        delete it on the map and the push takes it out of LOC."""
+        layers = self._pushed_and_captured(ui, n=0)
+        self._capture(ui)
+        self._field_capture_rich(ui, 2)
+        ui.msgbox.answers = [YES]
+        start_push(ui)
+        self._delete_poles(layers, "FIELD-1")
+        generate(ui)
+        push(ui)
+        (prompt,) = self._prompt(ui)
+        assert "  - FIELD-1  (single)" in prompt[2]
+        assert "FIELD-1" not in self._uids(ui) and "FIELD-2" in self._uids(ui)
+
+    def test_pull_now_lists_captures_it_cannot_place(self, ui):
+        """A capture in a category no point layer is mapped to stays in LOC,
+        is named in the report, and is still not the project's to delete."""
+        self._pushed_and_captured(ui, n=0)
+        self._capture(ui)
+        self._field_capture(ui, 1, category=CAT_CHAMBER)
+        ui.server.loc_state()["single"]["field-2"] = {
+            "loc_id": "field-2", "unique_asset_id": "FIELD-2", "category": CAT_STOPS,
+            "fields": {}, "origin_longitude": -6.43, "origin_latitude": 53.57}
+        ui.msgbox.answers = [YES]
+        start_push(ui)
+        (added,) = [c for c in ui.msgbox.calls if c[1] == "Field Captures Added"]
+        assert "FIELD-1  (Chambers)" in added[2]
+        assert "FIELD-2: no point layer is mapped to Stops" in added[2]
+        generate(ui)
+        ui.msgbox.answers = [PUSH_ANYWAY]
+        push(ui)
+        assert not self._prompt(ui)
+        assert {"FIELD-1", "FIELD-2"} <= self._uids(ui)
+
+    def test_pull_now_adds_field_captures_to_pulled_layers(self, ui):
+        """A project made by a pull: the capture joins the pulled layer with
+        its pulled copy, and no second set of layers appears."""
+        from qgis.core import QgsCoordinateReferenceSystem
+        self._capture(ui)
+        design_project(ui)
+        generate(ui)
+        push(ui)
+        QgsProject.instance().clear()
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(ITM))
+        save_project(ui.tmp, "pulled.qgz")
+        pull(ui)
+        self._field_capture(ui)
+        before_layers, before_map = self._layer_ids(), self._mapping_dump(ui)
+        posts = len(ui.server.requests_to("LOCs/plugin-v3", "POST"))
+        ui.msgbox.answers = [YES]                           # Pull now
+        start_push(ui)
+        assert len(self._stale(ui)) == 1
+        assert len(ui.server.requests_to("LOCs/plugin-v3", "POST")) == posts
+        assert self._layer_ids() == before_layers
+        assert self._mapping_dump(ui) == before_map
+        assert any(f["_loc_id"] == "field-1" and f["_sloc_json"]
+                   for l in QgsProject.instance().mapLayers().values()
+                   if l.fields().indexOf("_sloc_json") >= 0
+                   for f in l.getFeatures())
+        n = len(ui.server.loc_state()["single"])
+        push(ui)
+        assert len(self._stale(ui)) == 1                    # no second warning
+        assert not self._prompt(ui)
+        assert len(ui.server.loc_state()["single"]) == n
+        assert "FIELD-1" in self._uids(ui)
+
+    def test_pull_now_keeps_unpushed_edits(self, ui):
+        """Pull now only adds the captures, so it is offered over edits not
+        pushed yet (it used to replace the map and was withheld, Bug 33);
+        the edit is still sent by the next push."""
+        from qgis.core import QgsCoordinateReferenceSystem
+        self._capture(ui)
+        design_project(ui)
+        generate(ui)
+        push(ui)
+        QgsProject.instance().clear()
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(ITM))
+        save_project(ui.tmp, "pulled.qgz")
+        pull(ui)
+        p4 = next(lid for lid, r in ui.server.loc_state()["single"].items()
+                  if r["unique_asset_id"] == "P4")
+        layer = next(l for l in QgsProject.instance().mapLayers().values()
+                     if l.fields().indexOf("_loc_id") >= 0
+                     and any(f["_loc_id"] == p4 for f in l.getFeatures()))
+        h = layer.fields().indexOf("Height")
+        fid = next(f.id() for f in layer.getFeatures() if f["_loc_id"] == p4)
+        layer.dataProvider().changeAttributeValues({fid: {h: "77"}})   # not pushed
+        self._field_capture(ui)
+        ui.msgbox.answers = [YES]                           # Pull now
+        start_push(ui)
+        assert layer.getFeature(fid)["Height"] == "77"
+        push(ui)
+        assert ui.server.loc_state()["single"][p4]["fields"]["Height"] == "77"
+        assert "FIELD-1" in self._uids(ui)
+
+    def test_stale_map_cancel_stops_the_push(self, ui):
+        layers = self._pushed_and_captured(ui)
+        self._delete_poles(layers, "P5")
+        generate(ui)
+        posts = len(ui.server.requests_to("LOCs/plugin-v3", "POST"))
+        ui.msgbox.answers = [CANCEL]
+        start_push(ui)
+        assert len(self._stale(ui)) == 1 and not self._prompt(ui)
+        assert len(ui.server.requests_to("LOCs/plugin-v3", "POST")) == posts
+        assert {"P5", "FIELD-1"} <= self._uids(ui)
+
+    def test_no_stale_warning_when_the_map_is_current(self, ui):
+        self._capture(ui)
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        self._delete_poles(layers, "P5")
+        generate(ui)
+        push(ui)
+        assert not self._stale(ui) and self._prompt(ui)
+
+    def test_no_stale_warning_outside_capture_mode(self, ui):
+        """A normal project replaces the location: the unseen record is
+        listed for deletion instead (the existing prompt)."""
+        design_project(ui)
+        generate(ui)
+        push(ui)
+        self._field_capture(ui)
+        ui.msgbox.answers = [NO]
+        start_push(ui)
+        assert not self._stale(ui)
+        (prompt,) = self._prompt(ui)
+        assert "FIELD-1" in prompt[2]
+
+    def test_no_stale_warning_without_a_record_of_the_project(self, ui):
+        """Pulled with an older plugin: it cannot tell field captures from
+        deletions; the older-plugin deletion prompt covers it."""
+        self._pushed_and_captured(ui)
+        cache = eb._load_stamp_cache()
+        cache.pop(eb._KNOWN_KEY, None)
+        eb._save_stamp_cache(cache)
+        ui.plugin._pulled_loc_ids = set()
+        ui.msgbox.answers = [NO]
+        start_push(ui)
+        assert not self._stale(ui)
+        assert "older plugin version" in self._prompt(ui)[0][2]
+
+    def test_stale_warning_lists_many_captures_in_details(self, ui):
+        self._pushed_and_captured(ui, n=20)
+        ui.msgbox.answers = [CANCEL]
+        start_push(ui)
+        (warn,) = self._stale(ui)
+        assert "LOC has 20 asset(s) captured in the field" in warn[2]
+        assert "... and 5 more (see Show Details)." in warn[2]
+
+    def _set_height(self, layers, pole, value):
+        poles = layers["poles"]
+        fid = [f.id() for f in poles.getFeatures() if f["PoleID"] == pole][0]
+        poles.dataProvider().changeAttributeValues(
+            {fid: {poles.fields().indexOf("Height"): value}})
+
+
+class TestMergeWithLoc:
+    """A push keeps what changed in LOC since the pull (by the LOC app on
+    site, or the web) and sends what changed on the map; a value changed
+    on both sides is the user's call.  Brandon, 10 Nov 2026: compare the
+    map and LOC before pushing, without overwriting local changes."""
+
+    STALE, CONFLICT = "Map Is Behind LOC", "Changed in QGIS and in LOC"
+
+    def _pulled(self, ui, capture=True):
+        from qgis.core import QgsCoordinateReferenceSystem
+        if capture:
+            ui.server.capture_projects.add("p-1")
+        design_project(ui)
+        generate(ui)
+        push(ui)
+        QgsProject.instance().clear()
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(ITM))
+        save_project(ui.tmp, "pulled.qgz")
+        pull(ui)
+        ui.msgbox.calls.clear()
+
+    def _rec(self, ui, uid):
+        return next(r for r in ui.server.loc_state()["single"].values()
+                    if r["unique_asset_id"] == uid)
+
+    def _in_loc(self, ui, uid, field, value):
+        """Someone changes a field in LOC (the stored record)."""
+        self._rec(ui, uid)["fields"][field] = value
+
+    def _on_map(self, ui, uid, field, value):
+        lid = self._rec(ui, uid)["loc_id"]
+        for l in QgsProject.instance().mapLayers().values():
+            if l.fields().indexOf("_loc_id") < 0 or l.fields().indexOf(field) < 0:
+                continue
+            for f in l.getFeatures():
+                if f["_loc_id"] == lid:
+                    l.dataProvider().changeAttributeValues(
+                        {f.id(): {l.fields().indexOf(field): value}})
+                    return
+        raise AssertionError(f"{uid} not on the map")
+
+    def _titles(self, ui):
+        return ui.msgbox.titles()
+
+    def _pushes(self, ui):
+        return len(ui.server.requests_to("LOCs/plugin-v3", "POST"))
+
+    @pytest.mark.parametrize("capture", [True, False], ids=["capture on", "capture off"])
+    def test_change_in_loc_is_kept_and_map_edit_lands(self, ui, capture):
+        """Scenario (a): a field changed in LOC after the pull is not put
+        back by a push from the older map, and the map's own edit lands."""
+        self._pulled(ui, capture)
+        self._in_loc(ui, "P4", "Height", "99")
+        self._on_map(ui, "P3", "Height", "7")
+        push(ui)                                    # default: Push
+        warn = [c for c in ui.msgbox.calls if c[1] == self.STALE]
+        assert warn and "1 asset(s) were changed in LOC" in warn[0][2]
+        assert "P4  (Height)" in warn[0][2]
+        assert self.CONFLICT not in self._titles(ui)
+        assert self._rec(ui, "P4")["fields"]["Height"] == "99"
+        assert self._rec(ui, "P3")["fields"]["Height"] == "7"
+        push(ui)                                    # second push: still kept
+        assert self._rec(ui, "P4")["fields"]["Height"] == "99"
+        assert self._rec(ui, "P3")["fields"]["Height"] == "7"
+
+    def test_unedited_map_keeps_loc_change(self, ui):
+        """Only LOC's own edits: the push keeps them, so there is nothing
+        for Pull now to add and the box offers Push and Cancel."""
+        self._pulled(ui)
+        self._in_loc(ui, "P4", "Height", "99")
+        ui.msgbox.answers = [PUSH_ANYWAY]
+        push(ui)
+        (warn,) = [c for c in ui.msgbox.calls if c[1] == self.STALE]
+        assert warn[2].startswith("1 asset(s) were changed in LOC since your last "
+                                  "pull. The push keeps LOC's changes.")
+        assert last_preview_stats(ui).get("Updated LOCs") in ("0", None)
+        assert self._rec(ui, "P4")["fields"]["Height"] == "99"
+
+    def test_different_fields_of_one_record_both_land(self, ui):
+        self._pulled(ui)
+        self._in_loc(ui, "P4", "Height", "99")
+        self._on_map(ui, "P4", "Material", "Concrete")
+        push(ui)
+        assert self.CONFLICT not in self._titles(ui)
+        f = self._rec(ui, "P4")["fields"]
+        assert (f["Height"], f["Material"]) == ("99", "Concrete")
+
+    def test_same_value_changed_on_both_sides_keep_mine(self, ui):
+        self._pulled(ui)
+        self._in_loc(ui, "P4", "Height", "99")
+        self._on_map(ui, "P4", "Height", "7")
+        ui.msgbox.answers = [YES]                   # Keep my QGIS values
+        push(ui)
+        (c,) = [c for c in ui.msgbox.calls if c[1] == self.CONFLICT]
+        assert "P4 · Height: QGIS '7', LOC '99' (was '10')" in c[2]
+        assert self._rec(ui, "P4")["fields"]["Height"] == "7"
+
+    def test_same_value_changed_on_both_sides_keep_loc(self, ui):
+        """Keep LOC's: LOC keeps 99, and the next push neither asks again
+        nor puts the map's 7 back."""
+        self._pulled(ui)
+        self._in_loc(ui, "P4", "Height", "99")
+        self._on_map(ui, "P4", "Height", "7")
+        ui.msgbox.answers = [NO]                    # Keep LOC's values
+        push(ui)
+        assert self._rec(ui, "P4")["fields"]["Height"] == "99"
+        ui.msgbox.calls.clear()
+        push(ui)
+        assert self.CONFLICT not in self._titles(ui)
+        assert self._rec(ui, "P4")["fields"]["Height"] == "99"
+
+    def test_conflict_cancel_sends_nothing(self, ui):
+        self._pulled(ui)
+        self._in_loc(ui, "P4", "Height", "99")
+        self._on_map(ui, "P4", "Height", "7")
+        n, previews = self._pushes(ui), len(ui.preview_stats)
+        ui.msgbox.answers = [CANCEL]
+        start_push(ui)
+        assert self._pushes(ui) == n and len(ui.preview_stats) == previews
+        assert self._rec(ui, "P4")["fields"]["Height"] == "99"
+
+    def test_revert_after_a_push_is_sent(self, ui):
+        """The pulled copy moves forward with each push, so putting a value
+        back to what was pulled is still a change."""
+        self._pulled(ui)
+        self._on_map(ui, "P3", "Height", "7")
+        push(ui)
+        self._on_map(ui, "P3", "Height", "10")
+        push(ui)
+        assert self._rec(ui, "P3")["fields"]["Height"] == "10"
+        assert self.CONFLICT not in self._titles(ui)
+
+    def _route(self, ui):
+        (m,) = ui.server.loc_state()["multi"].values()
+        return m
+
+    def _add_stop_in_loc(self, ui):
+        """Scenario (b): someone adds a stop between the route's first two."""
+        import copy as _copy
+        m = self._route(ui)
+        st = sorted(m["Stops"], key=lambda s: s["stopNumber"])
+        new = _copy.deepcopy(st[0])
+        new["stop_id"] = "stop-field-1"
+        new["singleLoc"].update(loc_id="field-stop-1", origin_id="o-field-stop-1",
+                                unique_asset_id="CBL-001_Field Joint",
+                                actual_asset_name="CBL-001_Field Joint")
+        a, b = st[0]["singleLoc"], st[1]["singleLoc"]
+        new["singleLoc"]["origin_longitude"] = (a["origin_longitude"] + b["origin_longitude"]) / 2
+        new["singleLoc"]["origin_latitude"] = (a["origin_latitude"] + b["origin_latitude"]) / 2
+        st.insert(1, new)
+        for i, s_ in enumerate(st, start=1):
+            s_["stopNumber"] = i
+        m["Stops"] = st
+        return [s_["singleLoc"]["loc_id"] for s_ in st]
+
+    @pytest.mark.parametrize("capture", [True, False], ids=["capture on", "capture off"])
+    def test_stop_added_in_loc_stays_on_its_route(self, ui, capture):
+        self._pulled(ui, capture)
+        want = self._add_stop_in_loc(ui)
+        self._on_map(ui, "P3", "Height", "7")
+        push(ui)
+        (warn,) = [c for c in ui.msgbox.calls if c[1] == self.STALE]
+        assert "1 stop(s) were added to routes in LOC." in warn[2]
+        assert "LOCs Will Be Deleted" not in self._titles(ui)
+        order = [s_["singleLoc"]["loc_id"] for s_ in
+                 sorted(self._route(ui)["Stops"], key=lambda s: s["stopNumber"])]
+        assert order == want
+        push(ui)                                    # and on the next push
+        order = [s_["singleLoc"]["loc_id"] for s_ in
+                 sorted(self._route(ui)["Stops"], key=lambda s: s["stopNumber"])]
+        assert order == want
+        assert "LOCs Will Be Deleted" not in self._titles(ui)
+
+    def test_stop_removed_in_loc_is_not_put_back(self, ui):
+        self._pulled(ui)
+        m = self._route(ui)
+        st = sorted(m["Stops"], key=lambda s: s["stopNumber"])
+        gone = st[1]["singleLoc"]["loc_id"]
+        m["Stops"] = [s_ for s_ in st if s_["singleLoc"]["loc_id"] != gone]
+        self._on_map(ui, "P3", "Height", "7")
+        push(ui)
+        (warn,) = [c for c in ui.msgbox.calls if c[1] == self.STALE]
+        assert "1 stop(s) were removed from routes in LOC." in warn[2]
+        assert gone not in [s_["singleLoc"]["loc_id"] for s_ in self._route(ui)["Stops"]]
+
+    def test_route_renamed_in_loc_is_kept(self, ui):
+        self._pulled(ui)
+        self._route(ui)["multiName"] = "CBL-001 renamed on site"
+        self._on_map(ui, "P3", "Height", "7")
+        push(ui)
+        assert self._route(ui)["multiName"] == "CBL-001 renamed on site"
+
+    def test_values_only_loc_changes_are_kept_and_named(self, ui):
+        """Photos, flags and the like are changed in the LOC app, never in
+        QGIS: a push keeps LOC's and the warning names them."""
+        self._pulled(ui)
+        rec = self._rec(ui, "P4")
+        assert "is_flagged" in rec
+        rec["is_flagged"] = True                    # flagged on site
+        self._on_map(ui, "P3", "Height", "7")
+        push(ui)
+        (warn,) = [c for c in ui.msgbox.calls if c[1] == self.STALE]
+        assert "P4  (Flag)" in warn[2]
+        assert self._rec(ui, "P4")["is_flagged"] is True
+
+    def test_kept_stop_survives_generate_and_another_push(self, ui):
+        """The kept stop is now in the project's record; Generate must not
+        make it read as deleted on the map."""
+        self._pulled(ui)
+        want = self._add_stop_in_loc(ui)
+        self._on_map(ui, "P3", "Height", "7")
+        push(ui)
+        generate(ui)
+        ui.msgbox.calls.clear()
+        push(ui)
+        assert "LOCs Will Be Deleted" not in self._titles(ui)
+        order = [s_["singleLoc"]["loc_id"] for s_ in
+                 sorted(self._route(ui)["Stops"], key=lambda s: s["stopNumber"])]
+        assert order == want
+
+    def test_push_anyway_over_edits_on_a_drawn_map(self, ui):
+        """A map drawn in QGIS has no pulled copy to compare with; Push
+        anyway sends its edit and keeps the field capture."""
+        ui.server.capture_projects.add("p-1")
+        layers = design_project(ui)
+        generate(ui)
+        push(ui)
+        poles = layers["poles"]
+        fid = next(f.id() for f in poles.getFeatures() if f["PoleID"] == "P3")
+        poles.dataProvider().changeAttributeValues(
+            {fid: {poles.fields().indexOf("Height"): "7"}})
+        ui.server.loc_state()["single"]["field-1"] = {
+            "loc_id": "field-1", "unique_asset_id": "FIELD-1", "category": CAT_POLE,
+            "fields": {}, "origin_longitude": -6.2, "origin_latitude": 53.3}
+        ui.msgbox.answers = [PUSH_ANYWAY]
+        push(ui)
+        (warn,) = [c for c in ui.msgbox.calls if c[1] == self.STALE]
+        assert "Pull now adds them to your layers" in warn[2]
+        assert self._rec(ui, "P3")["fields"]["Height"] == "7"
+
+    def test_map_without_a_pulled_copy_pushes_as_before(self, ui):
+        """Drawn in QGIS, never pulled: nothing to compare with, so the map
+        is sent as it is (the limit given to Brandon)."""
+        ui.server.capture_projects.add("p-1")
+        design_project(ui)
+        generate(ui)
+        push(ui)
+        self._in_loc(ui, "P4", "Height", "99")
+        push(ui)
+        assert self._rec(ui, "P4")["fields"]["Height"] == "10"
 
 
 class TestEditCycles:
@@ -911,6 +1701,24 @@ class TestSync:
         stats = last_preview_stats(ui)
         assert stats == {"Created LOCs": "0", "Updated LOCs": "0",
                          "Deleted LOCs": "0", "Total Processed": "12"}
+
+    def test_synced_project_deletes_in_capture_mode(self, ui):
+        """A project matched to LOC by Sync (not pulled) holds the matched
+        records, so a capture-mode push deletes one removed here."""
+        seed_server(ui.server, ui.tmp)
+        ui.server.capture_projects.add("p-1")
+        QgsProject.instance().clear()
+        layers = design_project(ui)
+        self._sync(ui)
+        poles = layers["poles"]
+        poles.dataProvider().deleteFeatures(
+            [f.id() for f in poles.getFeatures() if f["PoleID"] == "P5"])
+        generate(ui)
+        push(ui)
+        prompt = [c for c in ui.msgbox.calls if c[1] == "LOCs Will Be Deleted"]
+        assert prompt and "older plugin version" not in prompt[-1][2]
+        uids = {r["unique_asset_id"] for r in ui.server.loc_state()["single"].values()}
+        assert "P5" not in uids
 
     def test_sync_guards(self, ui):
         login(ui)

@@ -121,6 +121,22 @@ def default_locations():
     ]
 
 
+# The record content the real server compares on a push (loc-next
+# ``originDiff``, plus the asset id since v1.29.1 and the category); it
+# never diffs timestamps or bookkeeping keys such as the wrapper id.
+_CONTENT = ("unique_asset_id", "actual_asset_name", "origin_status",
+            "origin_longitude", "origin_latitude", "origin_radius", "fields",
+            "sla_fields", "notes", "imageDescription", "transaction_id",
+            "category", "LOCDestination")
+
+
+def _changed(sent, stored):
+    """Whether a pushed record differs from the stored one in content.
+    Like ``originDiff``, only the keys the push carries are compared."""
+    sent, stored = sent or {}, stored or {}
+    return any(k in sent and sent[k] != stored.get(k) for k in _CONTENT)
+
+
 class FakeLocServer:
     """Owns the HTTP server thread and the mutable API state."""
 
@@ -139,6 +155,11 @@ class FakeLocServer:
         # LOC state per location: {"single": {loc_id: obj}, ...}
         self.state = {}
         self.push_count = 0
+        # Projects in LOC capture mode: their pushes merge (loc-next M0.5),
+        # deleting nothing.  Production has every project in it (9 Nov 2026).
+        self.capture_projects = set()
+        self.bin = []               # records moved to the recycle bin
+        self.history = []           # location history rows (loc-next wording)
         self._lock = threading.Lock()
 
         handler = self._make_handler()
@@ -253,10 +274,21 @@ class FakeLocServer:
         return index
 
     def _standalone_match(self, location_id, by_uid, kind, lid, rec):
-        """The stored record a pushed standalone *rec* updates, or None."""
+        """The stored record a pushed standalone *rec* updates, or None.
+
+        loc-next v1.29.1: by loc_id when the location holds it as a
+        standalone of that kind, else by asset id (the legacy rule).
+        """
+        held = self.loc_state(location_id)[kind].get(lid) if lid else None
+        if held is not None:
+            return held
         if rec.get("unique_asset_id"):
             return by_uid.get((rec["unique_asset_id"], kind))
-        return self.loc_state(location_id)[kind].get(lid)
+        return None
+
+    def is_capture(self, location_id):
+        loc = next((l for l in self.locations if l["id"] == location_id), None)
+        return bool(loc) and loc.get("project_id") in self.capture_projects
 
     def _diff_stats(self, location_id, payload):
         st = self.loc_state(location_id)
@@ -272,7 +304,7 @@ class FakeLocServer:
                     created += 1
                 else:
                     kept.add(old["loc_id"])
-                    if rec.get("updatedAt") != old.get("updatedAt"):
+                    if _changed(rec, old):
                         updated += 1
         new_ids = set(singles) | set(duals)
         for mid, ml in multis.items():
@@ -283,7 +315,7 @@ class FakeLocServer:
             old_dl = old["dualLoc"] if old else None
             if old_dl is None or old_dl["loc_id"] != dl["loc_id"]:
                 created += 1
-            elif dl.get("updatedAt") != old_dl.get("updatedAt"):
+            elif _changed(dl, old_dl):
                 updated += 1
             old_stops = {
                 s["singleLoc"]["loc_id"]: s["singleLoc"]
@@ -296,9 +328,10 @@ class FakeLocServer:
                 o = old_stops.get(sl["loc_id"])
                 if o is None:
                     created += 1
-                elif sl.get("updatedAt") != o.get("updatedAt"):
+                elif _changed(sl, o):
                     updated += 1
-        deleted = len(self.all_loc_ids(location_id) - kept)
+        deleted = (0 if self.is_capture(location_id)
+                   else len(self.all_loc_ids(location_id) - kept))
         return {
             "createdLocs": created,
             "updatedLocs": updated,
@@ -325,10 +358,82 @@ class FakeLocServer:
             old = self._standalone_match(location_id, by_uid, "dual", lid, rec) or {}
             rec = {**rec, "loc_id": old.get("loc_id", lid)}
             stored_duals[rec["loc_id"]] = rec
+        old = copy.deepcopy(st)
         st["single"] = copy.deepcopy(stored_singles)
         st["dual"] = copy.deepcopy(stored_duals)
         st["multi"] = copy.deepcopy(multis)
+        if self.is_capture(location_id):
+            # Merge push: whatever the payload left out stays.  A route left
+            # out stays whole; a stop dropped from a pushed route stays as a
+            # loose structure (its stop row goes, its LOC does not).
+            for mid, m in old["multi"].items():
+                if mid not in st["multi"]:
+                    st["multi"][mid] = m
+            present = self.all_loc_ids(location_id)
+            for kind in ("single", "dual"):
+                for lid, rec in old[kind].items():
+                    if lid not in present:
+                        st[kind][lid] = rec
+                        present.add(lid)
+            for m in old["multi"].values():
+                for stop in m["Stops"]:
+                    sl = stop["singleLoc"]
+                    if sl["loc_id"] not in present:
+                        st["single"][sl["loc_id"]] = sl
+                        present.add(sl["loc_id"])
+        else:
+            old_ids = set(old["single"]) | set(old["dual"])
+            for m in old["multi"].values():
+                old_ids.add(m["dualLoc"]["loc_id"])
+                old_ids |= {x["singleLoc"]["loc_id"] for x in m["Stops"]}
+            gone = old_ids - self.all_loc_ids(location_id)
+            self.bin += [{"loc_id": i, "location_id": location_id} for i in gone]
+            self._log_deletes(location_id, gone, old)
         self.push_count += 1
+
+    def _log_deletes(self, location_id, ids, st):
+        uids = {}
+        for kind in ("single", "dual"):
+            uids.update({lid: r.get("unique_asset_id") for lid, r in st[kind].items()})
+        for m in st["multi"].values():
+            uids[m["dualLoc"]["loc_id"]] = m["dualLoc"].get("unique_asset_id")
+            for x in m["Stops"]:
+                uids[x["singleLoc"]["loc_id"]] = x["singleLoc"].get("unique_asset_id")
+        for i in ids:
+            self.history.append({"location_id": location_id, "description":
+                                 f"Moved LOC {uids.get(i) or i} to the recycle bin "
+                                 "from the QGIS plugin"})
+
+    def delete_locs(self, ids):
+        """LOCs/delete-many: all or nothing; 404 when any id is unknown.
+        Deleting a route's cable removes the route (FK cascade); deleting
+        a stop's LOC removes its stop row."""
+        where = {}
+        for location_id, st in self.state.items():
+            for kind in ("single", "dual"):
+                for lid in st[kind]:
+                    where[lid] = (location_id, kind, None)
+            for mid, m in st["multi"].items():
+                where[m["dualLoc"]["loc_id"]] = (location_id, "route", mid)
+                for x in m["Stops"]:
+                    where[x["singleLoc"]["loc_id"]] = (location_id, "stop", mid)
+        if any(i not in where for i in ids):
+            return False
+        for location_id in {where[i][0] for i in ids}:
+            self._log_deletes(location_id, [i for i in ids if where[i][0] == location_id],
+                              self.state[location_id])
+        for i in ids:
+            location_id, kind, mid = where[i]
+            st = self.state[location_id]
+            if kind in ("single", "dual"):
+                st[kind].pop(i, None)
+            elif kind == "route":
+                st["multi"].pop(mid, None)
+            elif mid in st["multi"]:
+                m = st["multi"][mid]
+                m["Stops"] = [x for x in m["Stops"] if x["singleLoc"]["loc_id"] != i]
+            self.bin.append({"loc_id": i, "location_id": location_id})
+        return True
 
     def fetch_shape(self, location_id):
         st = self.loc_state(location_id)
@@ -389,7 +494,8 @@ class FakeLocServer:
                 parsed = urlparse(self.path)
                 path = parsed.path
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-                body = self._read_body() if method == "POST" else None
+                body = (self._read_body()
+                        if method in ("POST", "DELETE", "PATCH") else None)
                 with server._lock:
                     server.requests.append({
                         "method": method, "path": path, "query": query,
@@ -413,6 +519,12 @@ class FakeLocServer:
 
             def do_POST(self):
                 self._dispatch("POST")
+
+            def do_DELETE(self):
+                self._dispatch("DELETE")
+
+            def do_PATCH(self):
+                self._dispatch("PATCH")
 
             # -- routes -----------------------------------------------
             def _route(self, method, path, query, body):
@@ -449,14 +561,53 @@ class FakeLocServer:
                             },
                         })
                     return self._send(200, nested)
+                if ep == "logs":                    # loc-next: GET logs?location_id=
+                    lid = query.get("location_id", "")
+                    return self._send(200, {"data": [
+                        h for h in server.history if h["location_id"] == lid]})
                 if ep.startswith("locations/") and ep.endswith("/logs"):
-                    return self._send(200, {"logs": [{"msg": "created"}]})
+                    lid = ep.split("/")[1]
+                    return self._send(200, {"logs": [{"msg": "created"}] + [
+                        h for h in server.history if h["location_id"] == lid]})
                 if ep.startswith("locations/"):
                     lid = ep.split("/", 1)[1]
                     for loc in server.locations:
                         if loc["id"] == lid:
                             return self._send(200, loc)
                     return self._send(404, {"error": "Location not found"})
+
+                if ep.startswith("projects/") and method == "GET":
+                    pid = ep.split("/", 1)[1]
+                    loc = next((l for l in server.locations
+                                if l["project_id"] == pid), None)
+                    if loc is None:
+                        return self._send(404, {"message": "Project not found"})
+                    return self._send(200, {"project": {
+                        "id": pid, "name": loc["project_name"],
+                        "capture_mode": pid in server.capture_projects}})
+
+                if ep.startswith("projects/") and method == "PATCH":
+                    pid = ep.split("/", 1)[1]
+                    if "capture_mode" in (body or {}):
+                        (server.capture_projects.add if body["capture_mode"]
+                         else server.capture_projects.discard)(pid)
+                    return self._send(200, {"project": {
+                        "id": pid, "capture_mode": pid in server.capture_projects}})
+
+                if ep == "LOCs/delete-many" and method == "DELETE":
+                    ids = list(dict.fromkeys((body or {}).get("locIds") or []))
+                    if not ids or len(ids) > 500:
+                        return self._send(400, {"message": "locIds: 1 to 500 ids"})
+                    if not server.delete_locs(ids):
+                        return self._send(404, {"message": "One or more LOCs not found"})
+                    return self._send(200, {"message": f"{len(ids)} LOCs moved to recycle bin",
+                                            "success": True})
+                if ep.startswith("LOCs/") and method == "DELETE":
+                    lid = ep.split("/", 1)[1]
+                    if not server.delete_locs([lid]):
+                        return self._send(404, {"message": "LOC not found"})
+                    return self._send(200, {"message": "LOC moved to recycle bin",
+                                            "success": True})
 
                 if ep == "organizations/categories":
                     return self._send(200, {"categories": server.categories})

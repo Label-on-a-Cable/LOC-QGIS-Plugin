@@ -313,9 +313,17 @@ class MessageBoxRecorder:
         self.calls.append((kind, box.windowTitle(), box.text()))
         if self.on_call is not None:
             self.on_call(kind, box.windowTitle(), box.text())
-        if box.standardButtons() & QMessageBox.StandardButton.Yes:
+        sb = QMessageBox.StandardButton
+        if box.standardButtons() & sb.Yes:
             return self.answers.pop(0) if self.answers else self.default
-        return QMessageBox.StandardButton.Ok
+        if box.standardButtons() & ~(sb.Ok | sb.NoButton):
+            # A choice without Yes (e.g. Push / Cancel): the next queued
+            # answer, else the box's own default button.
+            if self.answers:
+                return self.answers.pop(0)
+            d = box.defaultButton()
+            return box.standardButton(d) if d is not None else sb.Cancel
+        return sb.Ok
 
 
 @pytest.fixture

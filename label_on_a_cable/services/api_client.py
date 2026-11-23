@@ -65,6 +65,9 @@ class ApiClient:
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
+            # LOC's activity log names the plugin as the source of requests
+            # outside its own pull/push routes (e.g. bulk deletes) by this.
+            "X-LOC-Client": "qgis-plugin",
         })
 
     # ------------------------------------------------------------------
@@ -213,6 +216,21 @@ class ApiClient:
             ) from exc
         return self._handle_response(resp)
 
+    def _send(self, method, path, json=None, timeout=DEFAULT_TIMEOUT):
+        """Perform a DELETE / PATCH request and return parsed data."""
+        url = self._url(path)
+        try:
+            resp = self.session.request(method, url, json=json, timeout=timeout)
+        except requests.ConnectionError as exc:
+            raise NetworkException(
+                f"Connection failed: {url} — {exc}",
+            ) from exc
+        except requests.Timeout as exc:
+            raise NetworkException(
+                f"Request timed out after {timeout}s: {url}",
+            ) from exc
+        return self._handle_response(resp)
+
     # ------------------------------------------------------------------
     # Media assets (category icons)
     # ------------------------------------------------------------------
@@ -339,6 +357,14 @@ class ApiClient:
             data = data.get("locations", [])
         return data
 
+    # 4b. Projects: one project (carries the capture-mode switch)
+    def get_project(self, project_id):
+        """GET projects/{project_id} → the project dict"""
+        data = self._get(f"projects/{project_id}")
+        if isinstance(data, dict) and isinstance(data.get("project"), dict):
+            return data["project"]
+        return data if isinstance(data, dict) else {}
+
     # 4. Locations: single location details
     def get_location(self, location_id):
         """GET locations/{location_id}"""
@@ -378,3 +404,25 @@ class ApiClient:
         params = {"stats": "true"} if preview else None
         return self._post("LOCs/plugin-v3", json=payload,
                           params=params, timeout=PUSH_TIMEOUT)
+
+    # 11. LOCs: move to the recycle bin (same bin as the push sweep)
+    def delete_locs(self, loc_ids, location_id=None):
+        """DELETE LOCs/delete-many  {"locIds": [...]}  (at most 500 ids).
+
+        *location_id* (ignored by the endpoint) lets LOC's activity log file
+        the delete under the location on servers that log the request as a
+        whole rather than per LOC."""
+        body = {"locIds": list(loc_ids)}
+        if location_id:
+            body["location_id"] = location_id
+        return self._send("DELETE", "LOCs/delete-many", json=body,
+                          timeout=PUSH_TIMEOUT)
+
+    def delete_loc(self, loc_id):
+        """DELETE LOCs/{loc_id}"""
+        return self._send("DELETE", f"LOCs/{loc_id}")
+
+    # 12. LOCs: bring one back from the recycle bin (keyed by its loc_id)
+    def restore_loc(self, loc_id):
+        """PATCH LOCs/bin/restore/{loc_id}"""
+        return self._send("PATCH", f"LOCs/bin/restore/{loc_id}")
