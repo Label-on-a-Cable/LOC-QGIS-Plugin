@@ -1021,9 +1021,64 @@ def remember_loc_ids(location_id: str, ids, forget=()) -> None:
     _save_stamp_cache(cache)
 
 
+def has_position(feat: QgsFeature) -> bool:
+    """True when *feat* has somewhere to be pushed: a drawn geometry, or
+    the position LOC holds for a pulled feature.  A row added in the
+    attribute table has neither."""
+    geom = feat.geometry()
+    if geom is not None and not geom.isNull() and not geom.isEmpty():
+        return True
+    return _stored_xy(feat, "_origin_lon", "_origin_lat") is not None
+
+
+def _feature_label(feat: QgsFeature, lm: LayerMapping) -> str:
+    """The name a user knows *feat* by, for warnings."""
+    for loc_field in ("Route ID", "Unique Asset Identifier", "Actual Asset Name"):
+        qfield = lm.qgis_field_for(loc_field)
+        value = _safe_value(feat, qfield) if qfield else ""
+        if value:
+            return value
+    return f"feature {feat.id()}"
+
+
+def _name_list(names: List[str], limit: int = 5) -> str:
+    shown = ", ".join(names[:limit])
+    if len(names) > limit:
+        shown += f" and {len(names) - limit} more"
+    return shown
+
+
+def features_without_position(
+    layer_mappings: List[LayerMapping],
+) -> List[Tuple[str, List[str]]]:
+    """``(layer_name, feature names)`` for mapped features with no
+    geometry — rows added in the attribute table but never drawn on the
+    map.  A line without geometry cannot become a route and a point has
+    no coordinates, so neither is pushed."""
+    project = QgsProject.instance()
+    out: List[Tuple[str, List[str]]] = []
+    for lm in layer_mappings:
+        if not lm.enabled_for_export:
+            continue
+        layer = project.mapLayer(lm.layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+        if layer.geometryType() == GEOM_LINE:
+            missing = [f for f in layer.getFeatures()
+                       if f.geometry() is None or f.geometry().isNull()
+                       or f.geometry().isEmpty()]
+        else:
+            missing = [f for f in layer.getFeatures() if not has_position(f)]
+        if missing:
+            out.append((lm.layer_name or layer.name(),
+                        [_feature_label(f, lm) for f in missing]))
+    return out
+
+
 def audit_export_coverage(
     layer_mappings: List[LayerMapping],
     categories: Dict[str, Category],
+    routes: Optional[List[Route]] = None,
 ) -> List[Tuple[str, int, str]]:
     """Report mapped layers whose features cannot reach the push payload.
 
@@ -1035,11 +1090,20 @@ def audit_export_coverage(
     ``category_id``).  Those features are dropped from the payload, and
     because absence *is* the delete, the server then bins them.
 
+    Within a layer that does reach the payload, two kinds of feature
+    still do not: features with no geometry (rows added in the attribute
+    table), and — given the generated *routes* — cable lines drawn after
+    routes were last generated, since a push sends the generated routes,
+    not the line layer.
+
     Returns ``(layer_name, feature_count, reason)`` for each affected
     layer that actually holds features.
     """
     project = QgsProject.instance()
     problems: List[Tuple[str, int, str]] = []
+    unplaced = dict(features_without_position(layer_mappings))
+    in_routes = ({(r.line_layer_id, r.line_feature_id) for r in routes}
+                 if routes else None)
 
     for lm in layer_mappings:
         layer = project.mapLayer(lm.layer_id)
@@ -1079,6 +1143,32 @@ def audit_export_coverage(
                 f"it is a point layer but '{cat.name}' is a dual category, "
                 "so its features are only pushed as route stops",
             ))
+            continue
+
+        names = unplaced.get(name, [])
+        if names:
+            problems.append((
+                name, len(names),
+                f"no geometry: {_name_list(names)}. Rows added in the "
+                "attribute table are not drawn on the map; draw them, "
+                "then generate routes again",
+            ))
+
+        if (in_routes is not None and layer.geometryType() == GEOM_LINE
+                and lm.include_in_routes and cat.is_dual):
+            new_lines = [
+                _feature_label(f, lm) for f in layer.getFeatures()
+                if (lm.layer_id, f.id()) not in in_routes
+                and f.geometry() is not None and not f.geometry().isNull()
+                and not f.geometry().isEmpty()
+            ]
+            if new_lines:
+                problems.append((
+                    name, len(new_lines),
+                    f"not in the generated routes: {_name_list(new_lines)}. "
+                    "They were drawn after routes were last generated; "
+                    "click Generate Route Labels, then push again",
+                ))
 
     return problems
 
@@ -1926,6 +2016,11 @@ def _build_standalone_single_locs(
         _set_current_layer(layer)
         for feat in layer.getFeatures():
             if not feat.isValid():
+                continue
+            if not has_position(feat):
+                # A row added in the attribute table: no geometry and no
+                # position from LOC.  It pushed at 0,0; the pre-push
+                # audit names it instead (features_without_position).
                 continue
 
             pt_xy = _point_wgs84(feat, lm.layer_id, transforms)

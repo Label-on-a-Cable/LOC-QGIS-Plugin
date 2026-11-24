@@ -292,6 +292,55 @@ class TestAuditExportCoverage:
         net.maps[1].enabled_for_export = False
         assert eb.audit_export_coverage(net.maps, net.cats) == []
 
+    # --- features that never reach the payload inside a healthy layer ----
+
+    def _add_rows(self, layer, rows):
+        """Add features the way the attribute table does: no geometry."""
+        feats = []
+        for attrs in rows:
+            f = QgsFeature(layer.fields())
+            for k, v in attrs.items():
+                f.setAttribute(k, v)
+            feats.append(f)
+        layer.dataProvider().addFeatures(feats)
+
+    def test_rows_without_geometry_are_named(self, net):
+        """Clanton 24 Nov: CLA_DUCT_26 and CLA_DUCT_27 were added in the
+        Duct (LOC) attribute table and the push left them out in silence."""
+        self._add_rows(net.layers["cables"], [{"AssetID": "CBL-026"},
+                                              {"AssetID": "CBL-027"}])
+        self._add_rows(net.layers["poles"], [{"PoleID": "P9"}])
+        problems = eb.audit_export_coverage(net.maps, net.cats, routes=net.routes)
+        by_layer = {name: (count, why) for name, count, why in problems}
+        assert by_layer["Fiber Cable"][0] == 2
+        assert "no geometry: CBL-026, CBL-027" in by_layer["Fiber Cable"][1]
+        assert by_layer["Poles"][0] == 1 and "no geometry: P9" in by_layer["Poles"][1]
+        assert eb.features_without_position(net.maps) == [
+            ("Fiber Cable", ["CBL-026", "CBL-027"]), ("Poles", ["P9"])]
+
+    def test_point_without_geometry_is_not_pushed_at_0_0(self, net):
+        self._add_rows(net.layers["poles"], [{"PoleID": "P9"}])
+        uids = [s["unique_asset_id"] for s in build(net)["single_locs"]]
+        assert "P9" not in uids
+
+    def test_line_drawn_after_generate_is_named(self, net):
+        from helpers import add_lines
+        add_lines(net.layers["cables"], [
+            ([(X0 + 800, Y0), (X0 + 900, Y0)], {"AssetID": "CBL-003"})])
+        (problem,) = eb.audit_export_coverage(net.maps, net.cats, routes=net.routes)
+        name, count, why = problem
+        assert (name, count) == ("Fiber Cable", 1)
+        assert "not in the generated routes: CBL-003" in why
+        assert "Generate Route Labels" in why
+        # Generated again, it is a route and nothing is reported
+        routes = rg.generate_routes(net.maps)
+        assert eb.audit_export_coverage(net.maps, net.cats, routes=routes) == []
+        # Without routes (never generated) only the layer checks run
+        assert eb.audit_export_coverage(net.maps, net.cats) == []
+
+    def test_generated_network_reports_nothing(self, net):
+        assert eb.audit_export_coverage(net.maps, net.cats, routes=net.routes) == []
+
 
 # ----------------------------------------------------------------------
 # Summary / metrics / validation

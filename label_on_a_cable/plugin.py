@@ -487,6 +487,7 @@ class LabelOnACablePlugin:
                 f"coordinates."
             )
         self.iface.messageBar().pushSuccess(self.PLUGIN_NAME, msg)
+        self._warn_features_without_geometry()
         self._show_route_review()
 
     def _run_reconstruction(self):
@@ -514,7 +515,27 @@ class LabelOnACablePlugin:
             self.PLUGIN_NAME,
             f"Reconstructed {count} route(s) with {total_stops} stop(s).",
         )
+        self._warn_features_without_geometry()
         self._show_route_review()
+
+    def _warn_features_without_geometry(self):
+        """Name mapped features that have no geometry: they cannot become
+        routes or be pushed, and used to be left out without a word."""
+        from .core.export_builder import features_without_position
+        missing = features_without_position(self.layer_mappings)
+        if not missing:
+            return
+        total = sum(len(names) for _layer, names in missing)
+        detail = "; ".join(
+            f"{layer}: {', '.join(names[:5])}"
+            + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+            for layer, names in missing)
+        self.iface.messageBar().pushWarning(
+            self.PLUGIN_NAME,
+            f"{total} feature(s) have no geometry and will not be pushed "
+            f"({detail}). Rows added in the attribute table must be drawn "
+            "on the map.",
+        )
 
     def _show_route_review(self):
         """Open (or re-focus) the modeless route review dialog."""
@@ -731,6 +752,7 @@ class LabelOnACablePlugin:
         # are dropped in silence and then binned by the sweep below.
         problems = audit_export_coverage(
             self.layer_mappings, self._categories_cache,
+            routes=self.cached_routes or None,
         )
         if not confirm_dropped_layers(self.iface.mainWindow(), problems):
             return
