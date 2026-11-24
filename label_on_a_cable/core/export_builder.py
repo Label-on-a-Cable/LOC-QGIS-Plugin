@@ -2359,6 +2359,19 @@ def _rebuild_stops_from_raw(
                     if entry in entries:
                         entries.remove(entry)
 
+    def _pop_named(entries, name, route_uid):
+        """Take the entry whose stop is called *name* out of *entries*."""
+        if not entries or not name:
+            return None
+        prefixed = f"{route_uid}_{name}" if route_uid else name
+        for field, wanted in (("actual_asset_name", (name,)),
+                              ("unique_asset_id", (name, prefixed))):
+            for entry in entries:
+                if _sloc_of(entry).get(field) in wanted:
+                    entries.remove(entry)
+                    return entry
+        return None
+
     for stop in intermediates:
         if stop.is_server_only:
             entry = server_only_entry.get(stop.server_loc_id)
@@ -2366,10 +2379,10 @@ def _rebuild_stops_from_raw(
                 continue        # no longer in the pulled record: nothing to send
             sl = _sloc_of(entry)
             claimed.add(id(entry))
-            resolved.append((stop, None,
+            resolved.append([stop, None,
                              (_float_val(sl.get("origin_longitude", 0)),
                               _float_val(sl.get("origin_latitude", 0))),
-                             entry))
+                             entry, None])
             continue
         pt_feature = _get_feature(
             project, stop.point_layer_id, stop.point_feature_id,
@@ -2386,10 +2399,23 @@ def _rebuild_stops_from_raw(
             if stored:
                 orig_list = orig_by_coord.get(
                     (round(stored[0], 8), round(stored[1], 8)))
-        matched_entry = orig_list.pop(0) if orig_list else None
+        # Several server stops can share one coordinate (an enclosure's
+        # IN/OUT pair plus the vault it sits in).  A stop takes the record
+        # that carries its own name there; only stops no record names
+        # share out what is left, below.  Taking the first record in line
+        # handed a vault its neighbour's _OUT record once that pair was
+        # collapsed, and the vault's own record was binned (Clanton
+        # CLA_FIB_24_1, 24 Nov 2026).
+        matched_entry = _pop_named(orig_list, stop.original_name, route_uid)
         if matched_entry is not None:
             claimed.add(id(matched_entry))
-        resolved.append((stop, pt_feature, pt_xy, matched_entry))
+        resolved.append([stop, pt_feature, pt_xy, matched_entry, orig_list])
+
+    for item in resolved:
+        if item[3] is None and item[4] and not item[0].is_server_only:
+            item[3] = item[4].pop(0)
+            claimed.add(id(item[3]))
+    resolved = [tuple(item[:4]) for item in resolved]
 
     # stop_ids already carried by matched entries; a stop built from
     # scratch must never reuse one of them.
@@ -2475,7 +2501,11 @@ def _rebuild_stops_from_raw(
                 # server may have added a disambiguation suffix (e.g. "_3") for
                 # egress stops in IN/OUT pairs. The server needs the suffix
                 # to correctly match and delete stops.
-                if orig_uid and orig_uid.startswith(new_base_uid):
+                # An IN/OUT suffix is not one of those: a pair collapsed
+                # to a pass-through drops it with the rename.
+                collapsed = (stop.stop_type == StopType.PASSTHROUGH
+                             and orig_uid[len(new_base_uid):] in ("_IN", "_OUT"))
+                if orig_uid and orig_uid.startswith(new_base_uid) and not collapsed:
                     patched_sloc["unique_asset_id"] = orig_uid
                 else:
                     patched_sloc["unique_asset_id"] = new_base_uid

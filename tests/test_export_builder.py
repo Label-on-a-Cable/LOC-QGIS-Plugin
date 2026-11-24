@@ -1003,6 +1003,84 @@ class TestPulledRoundTrip:
             [s["stop_id"] for s in sorted(raw["Stops"], key=lambda s: s["stopNumber"])]
         assert eb.validate_payload(payload) == []
 
+    def _toggle_type(self, qtbot, iface, route, stop):
+        """Click Toggle Type on *stop* in the real review dialog."""
+        from label_on_a_cable.ui.route_review_dialog import RouteReviewDialog
+        d = RouteReviewDialog([route], canvas=iface.mapCanvas())
+        qtbot.addWidget(d)
+        d._route_table.selectRow(0)
+        d._stop_table.selectRow(route.stops.index(stop))
+        d._on_toggle_type()
+
+    def test_collapsed_pair_bins_its_out_record_not_a_colocated_stop(
+            self, tmp_path, qtbot, iface):
+        """Clanton CLA_FIB_24_1: stops Enclosure_IN, Enclosure_OUT and a
+        vault share one coordinate, in that order.  Toggling the pair to a
+        pass-through must bin the _OUT record; the vault keeps its own."""
+        def mutate(data):
+            for s in data["multiLoc"][0]["Stops"]:
+                uid = s["singleLoc"]["unique_asset_id"]
+                if uid.endswith("Handhole X"):
+                    s["stopNumber"] += 2
+                elif "Chamber 1" in uid:
+                    s["stopNumber"] -= 1
+        p = pulled_network(tmp_path, mutate, extra_poles=self.COLOCATED)
+        raw = {s["singleLoc"]["unique_asset_id"]: s["singleLoc"]
+               for s in p.data["multiLoc"][0]["Stops"]}
+        routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        assert [s.original_name for s in r.intermediate_stops][2:5] == [
+            "CBL-001_Chamber 1_IN", "CBL-001_Chamber 1_OUT", "CBL-001_Handhole X"]
+        assert build_pulled(p, routes)["_test_doomed"] == []
+
+        ingress = next(s for s in r.stops if s.stop_type == StopType.INGRESS)
+        self._toggle_type(qtbot, iface, r, ingress)
+        assert ingress.stop_type == StopType.PASSTHROUGH
+        assert not [s for s in r.stops if s.stop_type == StopType.EGRESS]
+
+        payload = build_pulled(p, routes)
+        assert [uid for uid, _t in payload["_test_doomed"]] == ["CBL-001_Chamber 1_OUT"]
+        by_loc = {s["singleLoc"]["loc_id"]: s["singleLoc"]
+                  for s in payload["multiLocs"][0]["Stops"]}
+        hx = by_loc[raw["CBL-001_Handhole X"]["loc_id"]]
+        assert (hx["unique_asset_id"], hx["actual_asset_name"]) == (
+            "CBL-001_Handhole X", raw["CBL-001_Handhole X"]["actual_asset_name"])
+        ch = by_loc[raw["CBL-001_Chamber 1_IN"]["loc_id"]]
+        assert (ch["unique_asset_id"], ch["actual_asset_name"]) == (
+            "CBL-001_Chamber 1", "CBL-001_Chamber 1")
+        assert eb.validate_payload(payload) == []
+
+    def test_split_stop_does_not_take_a_colocated_pairs_records(
+            self, tmp_path, qtbot, iface):
+        """The opposite toggle: Handhole X shares a coordinate with the
+        Chamber 1 IN/OUT pair that follows it.  Splitting Handhole X into
+        IN/OUT adds one new stop; the chamber's records stay the chamber's
+        and nothing is binned."""
+        p = pulled_network(tmp_path, extra_poles=self.COLOCATED)
+        raw = {s["singleLoc"]["unique_asset_id"]: s["singleLoc"]
+               for s in p.data["multiLoc"][0]["Stops"]}
+        routes = ib.reconstruct_routes(p.maps, snap_tolerance=1.0)
+        r = [r for r in routes if r.line_name == "CBL-001"][0]
+        hx = next(s for s in r.stops if s.structure_name == "Handhole X")
+        self._toggle_type(qtbot, iface, r, hx)
+        assert [s.display_name for s in r.intermediate_stops][2:6] == [
+            "CBL-001_Handhole X_IN", "CBL-001_Handhole X_OUT",
+            "CBL-001_Chamber 1_IN", "CBL-001_Chamber 1_OUT"]
+
+        payload = build_pulled(p, routes)
+        assert payload["_test_doomed"] == []
+        stops = payload["multiLocs"][0]["Stops"]
+        by_uid = {s["singleLoc"]["unique_asset_id"]: s["singleLoc"] for s in stops}
+        for uid in ("CBL-001_Chamber 1_IN", "CBL-001_Chamber 1_OUT"):
+            assert by_uid[uid]["loc_id"] == raw[uid]["loc_id"]
+            assert by_uid[uid]["actual_asset_name"] == raw[uid]["actual_asset_name"]
+        assert by_uid["CBL-001_Handhole X_IN"]["loc_id"] == \
+            raw["CBL-001_Handhole X"]["loc_id"]
+        new_out = by_uid["CBL-001_Handhole X_OUT"]["loc_id"]
+        assert new_out and new_out not in {sl["loc_id"] for sl in raw.values()}
+        assert len({s["singleLoc"]["loc_id"] for s in stops}) == len(raw) + 1
+        assert eb.validate_payload(payload) == []
+
     def test_server_names_kept_when_id_points_at_colocated_structure(self, tmp_path):
         """Howth pattern: stop "Splice Enclosure 2_OUT" whose unique id is
         the co-located "Vault 8".  Unedited round trip changes nothing and
