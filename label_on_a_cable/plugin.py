@@ -518,6 +518,21 @@ class LabelOnACablePlugin:
         self._warn_features_without_geometry()
         self._show_route_review()
 
+    def _edited_route_ids(self):
+        """Route (multiLoc) ids of the routes edited in Route Review."""
+        from qgis.core import QgsProject, QgsVectorLayer
+        out = set()
+        for r in self.cached_routes:
+            if not r.has_edits:
+                continue
+            layer = QgsProject.instance().mapLayer(r.line_layer_id)
+            if not isinstance(layer, QgsVectorLayer) or layer.fields().indexOf("_multi_id") < 0:
+                continue
+            feat = layer.getFeature(r.line_feature_id)
+            if feat.isValid() and feat["_multi_id"]:
+                out.add(str(feat["_multi_id"]))
+        return out
+
     def _warn_features_without_geometry(self):
         """Name mapped features that have no geometry: they cannot become
         routes or be pushed, and used to be left out without a word."""
@@ -785,7 +800,13 @@ class LabelOnACablePlugin:
         counts_authoritative = False
 
         if self._pulled_multi_stop_counts:
-            expected_counts = self._pulled_multi_stop_counts
+            # A route changed in Route Review (Toggle Type, Remove) has a
+            # different stop count on purpose; the check is for routes the
+            # rebuild might have lost stops from.  It refused the push of
+            # pull → Generate → Toggle Type (scenario run, 24 Nov 2026).
+            edited = self._edited_route_ids()
+            expected_counts = {mid: n for mid, n in self._pulled_multi_stop_counts.items()
+                               if mid not in edited}
             counts_authoritative = True
             QgsMessageLog.logMessage(
                 f"Stop count source: in-memory pull data "
@@ -1044,6 +1065,12 @@ class LabelOnACablePlugin:
                       for lm in self.layer_mappings]
             apply_base_updates([l for l in layers if isinstance(l, QgsVectorLayer)],
                                rebase.base_updates)
+        # Pulled routes take what was pushed: stops, vertices, ids.
+        from .core.export_builder import refresh_pulled_routes
+        refresh_pulled_routes(task.payload)
+        for m in task.payload.get("multiLocs", []):
+            if m.get("id") in self._pulled_multi_stop_counts:
+                self._pulled_multi_stop_counts[m["id"]] = len(m.get("Stops") or [])
         remember_loc_ids(task.payload.get("location_id", ""),
                          payload_loc_ids(task.payload),
                          forget=task.deleted_ids)

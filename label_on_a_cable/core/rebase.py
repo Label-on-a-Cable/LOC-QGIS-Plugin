@@ -220,6 +220,13 @@ def _merge_record(mine: dict, base: dict, theirs: dict, uid: str,
         report.base_updates.setdefault(mine.get("loc_id"), []).extend(pushed)
     elif "updatedAt" in mine and "updatedAt" in theirs:
         mine["updatedAt"] = theirs["updatedAt"]
+        # The cable's destination carries its own updatedAt.  Left at the
+        # pulled copy's, a cable edited and pushed once went back on every
+        # later push with that older stamp, and LOC counted it as an update
+        # each time (scenario run, 24 Nov 2026).
+        if (isinstance(md, dict) and isinstance(td, dict)
+                and "updatedAt" in md and "updatedAt" in td):
+            md["updatedAt"] = td["updatedAt"]
     if kept:
         report.kept_from_loc.append((uid, sorted(set(kept))))
     return changed_here
