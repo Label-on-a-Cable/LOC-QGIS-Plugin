@@ -1457,6 +1457,36 @@ class TestPushGuards:
         push(ui)
         assert len(ui.server.loc_state()["single"]) == 5
 
+    def test_unpushable_features_named_before_the_push(self, ui):
+        """Clanton 24 Nov: cables added in the attribute table (no line on
+        the map) and a cable drawn after Generate were left out of the push
+        without a word; the preview just showed nothing created."""
+        from helpers import X0, Y0, add_lines
+        from qgis.core import QgsFeature
+        layers = design_project(ui)
+        generate(ui)
+        cables = layers["cables"]
+        row = QgsFeature(cables.fields())
+        row.setAttribute("AssetID", "CBL-026")
+        cables.dataProvider().addFeatures([row])
+        add_lines(cables, [([(X0 + 800, Y0), (X0 + 900, Y0)], {"AssetID": "CBL-003"})])
+        ui.msgbox.answers = [NO]
+        start_push(ui)
+        title, text = ui.msgbox.calls[-1][1:]
+        assert title == "Features Excluded From Push"
+        assert "Fiber Cable (1 feature(s)): no geometry: CBL-026" in text
+        assert "Fiber Cable (1 feature(s)): not in the generated routes: CBL-003" in text
+        assert ui.server.push_count == 0
+
+        # Generate names the row with no geometry too, then picks up CBL-003
+        generate(ui)
+        assert any("1 feature(s) have no geometry" in t and "CBL-026" in t
+                   for t in bar(ui, "warning"))
+        ui.msgbox.answers = [NO]
+        start_push(ui)
+        title, text = ui.msgbox.calls[-1][1:]
+        assert "no geometry: CBL-026" in text and "CBL-003" not in text
+
     def test_duplicate_asset_ids_warn(self, ui):
         layers = design_project(ui)
         poles = layers["poles"]
