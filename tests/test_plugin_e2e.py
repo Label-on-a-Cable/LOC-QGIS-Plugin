@@ -1614,6 +1614,123 @@ class TestPull:
         assert {s["loc_id"] for s in after["singleLOCs"]} == \
             {s["loc_id"] for s in json.loads(before)["singleLOCs"]}
 
+    def _layer_named(self, name):
+        return [l for l in QgsProject.instance().mapLayers().values() if l.name() == name][0]
+
+    def test_review_edits_on_a_pulled_route_push(self, ui):
+        """Pull → Generate (no layer change: the pulled routes are shown)
+        → Toggle Type → push was refused: "stop count changed: expected 4
+        (from pull)".  Review edits change a route's stops on purpose."""
+        self._pull_project(ui)
+        generate(ui)
+        dlg = ui.plugin._review_dlg
+        route = next(r for r in dlg._routes if r.line_name == "CBL-001")
+        dlg._route_table.selectRow(dlg._routes.index(route))
+        ing = next(s for s in route.stops if s.stop_type.name == "INGRESS")
+        dlg._stop_table.selectRow(route.stops.index(ing))
+        dlg._on_toggle_type()
+        push(ui)
+        assert "Push Validation Failed" not in ui.msgbox.titles()
+        stops = next(m for m in ui.server.loc_state()["multi"].values()
+                     if m["multiName"] == "CBL-001")["Stops"]
+        uids = [x["singleLoc"]["unique_asset_id"] for x in stops]
+        assert "CBL-001_Chamber 1" in uids
+        assert not any(u.endswith(("_IN", "_OUT")) for u in uids)
+
+    @pytest.mark.parametrize("ends", ["on structures", "off structures"])
+    def test_cable_drawn_after_pull_pushes_once(self, ui, ends):
+        """A cable drawn on a pulled map, pushed, then pushed again from the
+        same map: the second push must change nothing."""
+        from qgis.core import QgsFeature, QgsGeometry, QgsPointXY
+        self._pull_project(ui)
+        cables, poles = self._layer_named("Fiber Cable (LOC)"), self._layer_named("Pole (LOC)")
+        pts = {f["Unique Asset Identifier"]: f.geometry().asPoint() for f in poles.getFeatures()}
+        a, b = pts["P4"], pts["P5"]
+        if ends == "off structures":
+            a, b = QgsPointXY(a.x() + 0.001, a.y()), QgsPointXY(b.x() + 0.001, b.y())
+        f = QgsFeature(cables.fields())
+        f.setAttribute("Route ID", "CBL-NEW")
+        f.setGeometry(QgsGeometry.fromPolylineXY([a, b]))
+        assert cables.dataProvider().addFeatures([f])[0]
+        generate(ui)
+        push(ui)
+        assert last_preview_stats(ui)["Created LOCs"] == "1"
+        push(ui)
+        stats = last_preview_stats(ui)
+        assert (stats["Created LOCs"], stats["Updated LOCs"]) == ("0", "0")
+
+    def test_cable_field_edit_pushes_once(self, ui):
+        """Edit a pulled cable's field, push, push again from the same map:
+        the second push sent the cable's destination with its pulled
+        updatedAt, and LOC counted an update on every push."""
+        self._pull_project(ui)
+        cables = self._layer_named("Fiber Cable (LOC)")
+        fid = next(f.id() for f in cables.getFeatures() if f["Route ID"] == "CBL-001")
+        cables.dataProvider().changeAttributeValues(
+            {fid: {cables.fields().indexOf("Fiber Count"): "96"}})
+        push(ui)
+        assert last_preview_stats(ui)["Updated LOCs"] == "1"
+        push(ui)
+        stats = last_preview_stats(ui)
+        assert (stats["Created LOCs"], stats["Updated LOCs"]) == ("0", "0")
+
+    def _toggle(self, ui, name, stop_type):
+        dlg = ui.plugin._review_dlg
+        route = next(r for r in dlg._routes if r.line_name == name)
+        dlg._route_table.selectRow(dlg._routes.index(route))
+        stop = next(s for s in route.stops if s.stop_type.name == stop_type)
+        dlg._stop_table.selectRow(route.stops.index(stop))
+        dlg._on_toggle_type()
+
+    def test_stop_added_in_review_pushes_once(self, ui):
+        """Pull → Generate → Toggle Type on a passthrough (adds an OUT stop)
+        → push → push again from the same map.  The second push called the
+        plugin's own new stop "added in LOC" (Map Is Behind LOC) and pushed a
+        second copy of it (scenario run, 24 Nov 2026)."""
+        self._pull_project(ui)
+        generate(ui)
+        self._toggle(ui, "CBL-001", "PASSTHROUGH")
+        push(ui)
+        assert last_preview_stats(ui)["Created LOCs"] == "1"
+        n = len(ui.msgbox.calls)
+        push(ui)
+        assert [c[1] for c in ui.msgbox.calls[n:]] == []
+        stats = last_preview_stats(ui)
+        assert (stats["Created LOCs"], stats["Updated LOCs"]) == ("0", "0")
+        stops = next(m for m in ui.server.loc_state()["multi"].values()
+                     if m["multiName"] == "CBL-001")["Stops"]
+        uids = [x["singleLoc"]["unique_asset_id"] for x in stops]
+        assert len(uids) == len(set(uids)) == 5, uids
+
+    def test_stop_removed_in_review_stays_removed_after_generate(self, ui):
+        """Pull → Generate → Remove a stop → push.  Later in the same
+        session a layer edit and Generate rebuild the route from the line,
+        which still bends through the removed stop's structure."""
+        from qgis.PyQt.QtWidgets import QMessageBox
+        self._pull_project(ui)
+        generate(ui)
+        dlg = ui.plugin._review_dlg
+        route = next(r for r in dlg._routes if r.line_name == "CBL-001")
+        dlg._route_table.selectRow(dlg._routes.index(route))
+        p2 = next(s for s in route.stops if "Pole 2" in s.display_name)
+        dlg._stop_table.selectRow(route.stops.index(p2))
+        dlg._on_remove()
+        ui.msgbox.default = QMessageBox.StandardButton.Yes
+        push(ui)
+        poles = self._layer_named("Pole (LOC)")
+        fid = next(f.id() for f in poles.getFeatures() if f["Unique Asset Identifier"] == "P5")
+        poles.dataProvider().changeAttributeValues({fid: {poles.fields().indexOf("Material"): "Steel"}})
+        generate(ui)
+        n = len(ui.msgbox.calls)
+        push(ui)
+        stats = last_preview_stats(ui)
+        # The removal was this map's own: not "removed in LOC".
+        assert "Map Is Behind LOC" not in [c[1] for c in ui.msgbox.calls[n:]]
+        stops = next(m for m in ui.server.loc_state()["multi"].values()
+                     if m["multiName"] == "CBL-001")["Stops"]
+        assert not any("Pole 2" in x["singleLoc"]["unique_asset_id"] for x in stops)
+        assert stats["Created LOCs"] == "0"
+
     def test_field_edit_after_pull(self, ui):
         self._pull_project(ui)
         poles = [l for l in QgsProject.instance().mapLayers().values()

@@ -44,6 +44,7 @@ from qgis.core import (
     QgsFeature,
     QgsGeometry,
     QgsMessageLog,
+    QgsPointXY,
     QgsProject,
     QgsVectorLayer,
     QgsWkbTypes,
@@ -380,6 +381,115 @@ def payload_summary(payload: dict) -> dict:
         # `will_be_deleted` is added by the caller from predict_deletions();
         # it cannot be derived from the payload alone.
     }
+
+
+def refresh_pulled_routes(payload: dict) -> int:
+    """After a successful push: each pulled route line takes the route as
+    pushed — its stop list (``_mloc_json``), cable record (``_dloc_json``),
+    stop ids and vertices — as a fresh pull would give it.
+
+    Left at the pull, a route changed in Route Review (Toggle Type, Remove)
+    disagreed with LOC for the rest of the session: the next push read the
+    plugin's own new stop as "added in LOC" and sent a second copy of it,
+    and Generate rebuilt the route from the old vertices (scenario run,
+    24 Nov 2026).  Routes drawn in QGIS have no pulled copy; the stamp
+    cache covers them.  Returns the number of routes refreshed.
+    """
+    import copy
+    from .import_builder import _sorted_stop_coords
+
+    project = QgsProject.instance()
+    multis = payload.get("multiLocs", [])
+    changes: Dict[str, Tuple[QgsVectorLayer, dict, dict]] = {}
+    # Where structures stand (WGS 84, as pulled): a stop at none of them is
+    # one LOC holds without a structure, noted in _free_stops like a pull.
+    structure_keys = set()
+    for lyr in project.mapLayers().values():
+        if (isinstance(lyr, QgsVectorLayer) and lyr.geometryType() == GEOM_POINT
+                and lyr.crs().authid() == "EPSG:4326"):
+            for f in lyr.getFeatures():
+                g = f.geometry()
+                if g is not None and not g.isNull() and not g.isEmpty():
+                    pt = g.asPoint()
+                    structure_keys.add((round(pt.x(), 8), round(pt.y(), 8)))
+    for fm in payload.get("_feature_map", []):
+        if fm.get("type") != "multi" or fm.get("index", len(multis)) >= len(multis):
+            continue
+        layer = project.mapLayer(fm.get("layer_id", ""))
+        if not isinstance(layer, QgsVectorLayer) or layer.fields().indexOf("_mloc_json") < 0:
+            continue
+        feat = layer.getFeature(fm["feature_id"])
+        raw = _get_raw_json(feat, "_mloc_json") if feat.isValid() else None
+        if raw is None:
+            continue
+        pushed = multis[fm["index"]]
+        stops = copy.deepcopy(pushed.get("Stops") or [])
+        dual = copy.deepcopy(pushed.get("dualLoc") or {})
+        dest = dual.get("LOCDestination") or {}
+        new = copy.deepcopy(raw)
+        for k in ("stops", "Stops"):
+            new.pop(k, None)
+        new["Stops"] = stops
+        if dual:
+            for k in ("dualLOC", "dual_loc"):
+                new.pop(k, None)
+            new["dualLoc"] = dual
+        if pushed.get("multiName"):
+            new["multiName"] = pushed["multiName"]
+
+        ordered = sorted(stops, key=lambda x: x.get("stopNumber", 0))
+        parts, free = [], []
+        for st in ordered:
+            sl = st.get("singleLoc") or {}
+            lid = sl.get("loc_id", "")
+            lon, lat = sl.get("origin_longitude", ""), sl.get("origin_latitude", "")
+            try:
+                xy = (round(float(lon), 8), round(float(lat), 8))
+            except (TypeError, ValueError):
+                continue
+            if lid and xy != (0.0, 0.0):
+                parts.append(f"{xy[0]},{xy[1]}={lid},{sl.get('origin_id', '')},{lon},{lat}")
+                if xy not in structure_keys:
+                    free.append(lid)
+        idx = layer.fields().indexOf
+        attrs = {idx("_mloc_json"): _json.dumps(new, default=str),
+                 idx("_stop_ids"): ",".join(x.get("stop_id", "") for x in ordered),
+                 idx("_stop_loc_ids"): "|".join(parts)}
+        if dual and idx("_dloc_json") >= 0:
+            attrs[idx("_dloc_json")] = _json.dumps(dual, default=str)
+        if idx("_free_stops") >= 0:
+            attrs[idx("_free_stops")] = ",".join(free)
+        attrs = {k: v for k, v in attrs.items() if k >= 0}
+
+        geom = {}
+        try:
+            o = (float(dual["origin_longitude"]), float(dual["origin_latitude"]))
+            d = (float(dest["longitude"]), float(dest["latitude"]))
+        except (KeyError, TypeError, ValueError):
+            o = d = None
+        # Pulled lines are in WGS 84, vertex for vertex the route's points.
+        if o and d and layer.crs().authid() == "EPSG:4326":
+            pts = [QgsPointXY(*o)] + [QgsPointXY(x, y) for x, y in _sorted_stop_coords(stops)]
+            pts.append(QgsPointXY(*d))
+            geom = {feat.id(): QgsGeometry.fromPolylineXY(pts)}
+            for name, v in (("_origin_lon", dual["origin_longitude"]),
+                            ("_origin_lat", dual["origin_latitude"]),
+                            ("_dest_lon", dest["longitude"]), ("_dest_lat", dest["latitude"])):
+                if idx(name) >= 0:
+                    attrs[idx(name)] = str(v)
+        entry = changes.setdefault(layer.id(), (layer, {}, {}))
+        entry[1][feat.id()] = attrs
+        entry[2].update(geom)
+
+    n = 0
+    for layer, attr_changes, geom_changes in changes.values():
+        if attr_changes:
+            layer.dataProvider().changeAttributeValues(attr_changes)
+            n += len(attr_changes)
+        if geom_changes:
+            layer.dataProvider().changeGeometryValues(geom_changes)
+        layer.triggerRepaint()
+    return n
 
 
 def stamp_ids_after_push(payload: dict) -> int:
